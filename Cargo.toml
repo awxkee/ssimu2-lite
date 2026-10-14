@@ -1,0 +1,23 @@
+[package]
+name = "ssimu2-lite"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+description = "SSIMULACRA2 perceptual image quality"
+readme = "README.md"
+keywords = ["ssimulacra2", "image-quality", "metric", "perceptual", "ssim"]
+categories = ["multimedia::images", "computer-vision", "algorithms"]
+license = "BSD-3-Clause OR Apache-2.0"
+authors = ["Radzivon Bartoshyk"]
+documentation = "https://docs.rs/ssimu2-lite"
+repository = "https://github.com/awxkee/ssimu2-lite"
+exclude = ["/tools", "/.github", "*.png", "*.jpg", "/examples"]
+
+[features]
+default = ["avx", "neon", "sse"]
+avx = []
+neon = []
+sse = []
+
+[package.metadata.docs.rs]
+all-features = true

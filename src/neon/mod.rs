@@ -29,10 +29,17 @@
 
 mod blur;
 mod downsample;
+mod image;
 mod metric;
 mod xyb;
 
-pub(crate) use blur::{blur_horizontal_neon, blur_vertical_neon};
+pub(crate) use blur::{
+    blur_horizontal_neon, blur_moment_horizontal_neon, blur_moment_row_neon,
+    blur_moment_vertical_neon, blur_product_row_neon, blur_vertical_neon,
+};
 pub(crate) use downsample::downsample_rows_neon;
-pub(crate) use metric::{ss2_contribution_neon, ss2_expand_row_neon};
+pub(crate) use image::has_non_finite_neon;
+pub(crate) use metric::{
+    ss2_contribution_neon, ss2_edges_neon, ss2_expand_row_neon, ss2_map_neon, ss2_sums_neon,
+};
 pub(crate) use xyb::xyb_rows_neon;

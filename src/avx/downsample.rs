@@ -33,7 +33,14 @@ pub(crate) fn downsample_rows_avx2(top: &[f32], bottom: &[f32], dst: &mut [f32])
     assert!(top.len() / 2 >= dst.len());
     assert!(bottom.len() / 2 >= dst.len());
     let done = downsample::<4>(top, bottom, dst);
-    done + downsample::<1>(&top[2 * done..], &bottom[2 * done..], &mut dst[done..])
+    let done = done + downsample::<1>(&top[2 * done..], &bottom[2 * done..], &mut dst[done..]);
+    if done < dst.len() && done >= 8 {
+        let start = dst.len() - 8;
+        downsample::<1>(&top[2 * start..], &bottom[2 * start..], &mut dst[start..]);
+        dst.len()
+    } else {
+        done
+    }
 }
 
 #[inline]
@@ -41,13 +48,12 @@ pub(crate) fn downsample_rows_avx2(top: &[f32], bottom: &[f32], dst: &mut [f32])
 fn downsample<const N: usize>(top: &[f32], bottom: &[f32], dst: &mut [f32]) -> usize {
     const LANES: usize = 8;
     let quarter = _mm256_set1_ps(0.25);
-    let mut done = 0;
     let (vectors, _) = dst.as_chunks_mut::<LANES>();
     let (blocks, _) = vectors.as_chunks_mut::<N>();
+    let done = blocks.len() * N * LANES;
     for (block, dst) in blocks.iter_mut().enumerate() {
-        let dst = dst.as_flattened_mut();
         let x = block * N * LANES;
-        for lane in 0..N {
+        for (lane, dst) in dst.iter_mut().enumerate() {
             // Each output vector consumes two input vectors from each row.
             // Entry-point checks cover every load; stores fit this chunk.
             // Sum the top pair, then each bottom value to keep scalar rounding.
@@ -66,10 +72,9 @@ fn downsample<const N: usize>(top: &[f32], bottom: &[f32], dst: &mut [f32]) -> u
                 let value = _mm256_castsi256_ps(_mm256_permute4x64_epi64::<0xd8>(
                     _mm256_castps_si256(_mm256_mul_ps(sum, quarter)),
                 ));
-                _mm256_storeu_ps(dst.as_mut_ptr().add(lane * LANES), value);
+                _mm256_storeu_ps(dst.as_mut_ptr(), value);
             }
         }
-        done += N * LANES;
     }
     done
 }

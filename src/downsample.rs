@@ -49,11 +49,10 @@ fn selected_downsample_fn() -> DownsampleRowsFn {
             };
         }
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            return |top, bottom, dst| unsafe {
-                crate::neon::downsample_rows_neon(top, bottom, dst)
-            };
+        {
+            |top, bottom, dst| unsafe { crate::neon::downsample_rows_neon(top, bottom, dst) }
         }
+        #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
         downsample_rows_scalar
     })
 }

@@ -38,6 +38,7 @@
 
 use crate::blur::GaussianBlur;
 use crate::downsample::downsample;
+use crate::maps::{MapKind, compute_edge_maps, compute_map, map_sums};
 use crate::xyb::positive_xyb_of_linear;
 use crate::{Error, RgbImage};
 use std::sync::{Arc, OnceLock};
@@ -134,10 +135,7 @@ pub(crate) fn kernel() -> &'static [f32; TAPS] {
             -p[1] * p[1] / omega[1].sin(),
             p[2] * p[2] / omega[2].sin(),
         ];
-        let rho: Vec<f64> = omega
-            .iter()
-            .map(|w| (-0.5 * sigma * sigma * w * w).exp() / radius)
-            .collect();
+        let rho = omega.map(|w| (-0.5 * sigma * sigma * w * w).exp() / radius);
         let d13 = p[0] * r[1] - r[0] * p[1];
         let d35 = p[1] * r[2] - r[1] * p[2];
         let d51 = p[2] * r[0] - r[2] * p[0];
@@ -194,65 +192,59 @@ fn pool(map: &[f32], w1: f64, w4: f64, acc: Option<&mut [f32]>) -> f64 {
     w1 * m1 + w4 * n4
 }
 
-pub(crate) fn map_sums(map: &[f32]) -> (f64, f64) {
-    let mut s1 = [0.0f64; SUM_LANES];
-    let mut s4 = [0.0f64; SUM_LANES];
-    let (chunks, tail) = map.as_chunks::<SUM_LANES>();
-    for chunk in chunks {
-        for lane in 0..SUM_LANES {
-            let v = chunk[lane] as f64;
-            s1[lane] += v;
-            let v_sqr = v * v;
-            s4[lane] += v_sqr * v_sqr;
-        }
-    }
-    for (lane, &v) in tail.iter().enumerate() {
-        let v = v as f64;
-        s1[lane] += v;
-        let v_sqr = v * v;
-        s4[lane] += v_sqr * v_sqr;
-    }
-    (s1.iter().sum(), s4.iter().sum())
-}
-
 /// Compute the pixel contribution in f32. Normalizing by the fourth norm
 /// keeps the fourth powers bounded by the pixel count, even for HDR maps.
 /// The pooled totals and final score stay f64, including incremental deltas.
 pub(crate) fn add_map_contribution(map: &[f32], w1: f64, w4: f64, n4: f64, acc: &mut [f32]) {
-    let n = map.len() as f64;
-    let g1 = w1 / n;
-    if w4 == 0.0 || n4 == 0.0 {
-        contribute(
-            map,
-            MapContribution {
-                linear: g1 as f32,
+    PooledContribution::new(map.len(), w1, w4, n4).add(map, acc);
+}
+
+/// Coefficients for a whole map, reusable when processing it one row at a time.
+#[derive(Clone, Copy)]
+pub(crate) enum PooledContribution {
+    F32(MapContribution),
+    F64 { linear: f64, fourth: f64 },
+}
+
+impl PooledContribution {
+    pub(crate) fn new(pixels: usize, w1: f64, w4: f64, n4: f64) -> Self {
+        let n = pixels as f64;
+        let linear = w1 / n;
+        if w4 == 0.0 || n4 == 0.0 {
+            return Self::F32(MapContribution {
+                linear: linear as f32,
                 inv_norm: 0.0,
                 norm_weight: 0.0,
-            },
-            acc,
-        );
-        return;
-    }
-    let inv_n4 = (1.0 / n4) as f32;
-    let norm_weight = (w4 * n4 / (4.0 * n)) as f32;
-    if inv_n4.is_normal() && norm_weight.is_normal() {
-        contribute(
-            map,
-            MapContribution {
-                linear: g1 as f32,
-                inv_norm: inv_n4,
+            });
+        }
+        let inv_norm = (1.0 / n4) as f32;
+        let norm_weight = (w4 * n4 / (4.0 * n)) as f32;
+        if inv_norm.is_normal() && norm_weight.is_normal() {
+            Self::F32(MapContribution {
+                linear: linear as f32,
+                inv_norm,
                 norm_weight,
-            },
-            acc,
-        );
-        return;
+            })
+        } else {
+            // Tiny or large norms may have unrepresentable f32 factors.
+            Self::F64 {
+                linear,
+                fourth: w4 / (4.0 * n * n4 * n4 * n4),
+            }
+        }
     }
-    // Tiny or large norms may have unrepresentable f32 factors.
-    let g4 = w4 / (4.0 * n * n4 * n4 * n4);
-    for (a, &v) in acc.iter_mut().zip(map) {
-        let v = v as f64;
-        let v_sqr = v * v;
-        *a += (g1 * v + g4 * v_sqr * v_sqr) as f32;
+
+    pub(crate) fn add(self, map: &[f32], acc: &mut [f32]) {
+        match self {
+            Self::F32(p) => contribute(map, p, acc),
+            Self::F64 { linear, fourth } => {
+                for (a, &v) in acc.iter_mut().zip(map) {
+                    let v = v as f64;
+                    let square = v * v;
+                    *a += (linear * v + fourth * square * square) as f32;
+                }
+            }
+        }
     }
 }
 
@@ -268,6 +260,7 @@ type ExpandRowFn = unsafe fn(&[f32], &mut [f32], f32) -> usize;
 
 struct MapKernels {
     contribution: ContributionFn,
+    fused: bool,
     expand: [ExpandRowFn; NUM_SCALES],
 }
 
@@ -278,6 +271,7 @@ fn map_kernels() -> &'static MapKernels {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
             return MapKernels {
                 contribution: crate::avx::ss2_contribution_avx2,
+                fused: true,
                 expand: [
                     crate::avx::ss2_expand_row_avx2::<1>,
                     crate::avx::ss2_expand_row_avx2::<2>,
@@ -288,9 +282,25 @@ fn map_kernels() -> &'static MapKernels {
                 ],
             };
         }
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+        if std::is_x86_feature_detected!("sse4.1") {
+            return MapKernels {
+                contribution: crate::sse::ss2_contribution_sse41,
+                fused: false,
+                expand: [
+                    crate::sse::ss2_expand_row_sse41::<1>,
+                    crate::sse::ss2_expand_row_sse41::<2>,
+                    crate::sse::ss2_expand_row_sse41::<4>,
+                    crate::sse::ss2_expand_row_sse41::<8>,
+                    crate::sse::ss2_expand_row_sse41::<16>,
+                    crate::sse::ss2_expand_row_sse41::<32>,
+                ],
+            };
+        }
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
         return MapKernels {
             contribution: crate::neon::ss2_contribution_neon,
+            fused: true,
             expand: [
                 crate::neon::ss2_expand_row_neon::<1>,
                 crate::neon::ss2_expand_row_neon::<2>,
@@ -303,6 +313,7 @@ fn map_kernels() -> &'static MapKernels {
         #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
         MapKernels {
             contribution: contribution_scalar,
+            fused: false,
             expand: [
                 expand_row_scalar::<1>,
                 expand_row_scalar::<2>,
@@ -315,7 +326,6 @@ fn map_kernels() -> &'static MapKernels {
     })
 }
 
-#[cfg(any(test, not(all(target_arch = "aarch64", feature = "neon"))))]
 pub(crate) fn contribution_scalar(map: &[f32], p: MapContribution, acc: &mut [f32]) -> usize {
     if p.norm_weight == 0.0 {
         for (a, &v) in acc.iter_mut().zip(map) {
@@ -336,8 +346,11 @@ fn contribute(map: &[f32], p: MapContribution, acc: &mut [f32]) {
     // SAFETY: dispatch checked the CPU features and both slices have equal
     // lengths. The kernel reads/writes complete vectors and returns its prefix.
     let done = unsafe { (map_kernels().contribution)(map, p, acc) };
-    // SIMD kernels use FMA; keep their short tails fused as well. The portable
-    // kernel processes the whole slice without requiring hardware FMA.
+    // Match the selected kernel's arithmetic in its short tail.
+    if !map_kernels().fused {
+        contribution_scalar(&map[done..], p, &mut acc[done..]);
+        return;
+    }
     for (a, &v) in acc[done..].iter_mut().zip(&map[done..]) {
         if p.norm_weight == 0.0 {
             *a = p.linear.mul_add(v, *a);
@@ -351,9 +364,16 @@ fn contribute(map: &[f32], p: MapContribution, acc: &mut [f32]) {
 
 #[cfg(any(test, not(all(target_arch = "aarch64", feature = "neon"))))]
 fn expand_row_scalar<const STEP: usize>(src: &[f32], dst: &mut [f32], share: f32) -> usize {
-    for (pixels, &v) in dst.chunks_mut(STEP).zip(src) {
+    let (runs, tail) = dst.as_chunks_mut::<STEP>();
+    for (pixels, &v) in runs.iter_mut().zip(src) {
         let contribution = v * share;
         for out in pixels {
+            *out += contribution;
+        }
+    }
+    if let Some(&v) = src.get(runs.len()) {
+        let contribution = v * share;
+        for out in tail {
             *out += contribution;
         }
     }
@@ -393,81 +413,13 @@ pub(crate) fn accumulate_scale_map(
     }
 }
 
-/// Independent lanes break the pooled sums' per-pixel dependency chain and
-/// let LLVM vectorize the map calculation together with the f64 reductions.
-const SUM_LANES: usize = 8;
-
-pub(crate) fn replace_map<const INPUTS: usize>(
-    map: &mut [f32],
-    inputs: [&[f32]; INPUTS],
-    sums: &mut (f64, f64),
-    need_fourth: bool,
-    value: impl Fn([f32; INPUTS]) -> f32,
-) {
-    // Select once per row, keeping the map math and independent f64 lanes
-    // vectorizable without a norm-weight branch inside the pixel loop.
-    if need_fourth {
-        replace_map_with_norm::<INPUTS, true>(map, inputs, sums, value);
-    } else {
-        replace_map_with_norm::<INPUTS, false>(map, inputs, sums, value);
-    }
-}
-
-fn replace_map_with_norm<const INPUTS: usize, const FOURTH: bool>(
-    map: &mut [f32],
-    inputs: [&[f32]; INPUTS],
-    sums: &mut (f64, f64),
-    value: impl Fn([f32; INPUTS]) -> f32,
-) {
-    let n = map.len();
-    assert!(inputs.iter().all(|input| input.len() == n));
-    let mut delta1 = [0.0f64; SUM_LANES];
-    let mut delta4 = [0.0f64; SUM_LANES];
-    let (chunks, tail) = map.as_chunks_mut::<SUM_LANES>();
-    let input_chunks = inputs.map(|input| input.as_chunks::<SUM_LANES>().0);
-    for (i, chunk) in chunks.iter_mut().enumerate() {
-        let input = input_chunks.map(|chunks| &chunks[i]);
-        for lane in 0..SUM_LANES {
-            let new = value(input.map(|input| input[lane]));
-            let old = chunk[lane] as f64;
-            let v = new as f64;
-            delta1[lane] += v - old;
-            if FOURTH {
-                let v_sqr = v * v;
-                let old_sqr = old * old;
-                delta4[lane] += v_sqr * v_sqr - old_sqr * old_sqr;
-            }
-            chunk[lane] = new;
-        }
-    }
-    let offset = n - tail.len();
-    for (i, out) in tail.iter_mut().enumerate() {
-        let new = value(inputs.map(|input| input[offset + i]));
-        let old = *out as f64;
-        let v = new as f64;
-        delta1[i] += v - old;
-        if FOURTH {
-            let v_sqr = v * v;
-            let old_sqr = old * old;
-            delta4[i] += v_sqr * v_sqr - old_sqr * old_sqr;
-        }
-        *out = new;
-    }
-    sums.0 += delta1.iter().sum::<f64>();
-    if FOURTH {
-        sums.1 += delta4.iter().sum::<f64>();
-    }
-}
-
 /// Scale sizes: as in the reference, the next scale exists while this one is
 /// at least 8×8, so the coarsest scale may be smaller.
-pub(crate) fn scale_dims(mut w: usize, mut h: usize) -> Vec<(usize, usize)> {
-    let mut dims = vec![(w, h)];
-    while dims.len() < NUM_SCALES && w >= MIN_SIZE && h >= MIN_SIZE {
-        (w, h) = (w.div_ceil(2), h.div_ceil(2));
-        dims.push((w, h));
-    }
-    dims
+pub(crate) fn scale_dims(w: usize, h: usize) -> impl Iterator<Item = (usize, usize)> + Clone {
+    std::iter::successors(Some((w, h)), |&(w, h)| {
+        (w >= MIN_SIZE && h >= MIN_SIZE).then(|| (w.div_ceil(2), h.div_ceil(2)))
+    })
+    .take(NUM_SCALES)
 }
 
 /// The SSIM map value from the two means, variances and covariance.
@@ -522,10 +474,11 @@ impl PreparedReference {
         let mut lin = image.to_linear()?;
         let dims = scale_dims(w0, h0);
         let mut blur = GaussianBlur::with_kernel(w0, *kernel(), true);
-        let mut scales = Vec::with_capacity(dims.len());
-        for (scale, &(w, h)) in dims.iter().enumerate() {
+        let count = dims.clone().count();
+        let mut scales = Vec::with_capacity(count);
+        let (mut pw, mut ph) = (w0, h0);
+        for (scale, (w, h)) in dims.enumerate() {
             if scale > 0 {
-                let (pw, ph) = dims[scale - 1];
                 for plane in &mut lin {
                     *plane = downsample(plane, pw, ph).0;
                 }
@@ -535,7 +488,7 @@ impl PreparedReference {
             let mut mu: [Vec<f32>; 3] = Default::default();
             let mut sigma: [Vec<f32>; 3] = Default::default();
             for c in 0..3 {
-                let active = active_maps(c, scale, dims.len());
+                let active = active_maps(c, scale, count);
                 if active.contains(&true) {
                     mu[c] = vec![0.0; w * h];
                     blur.blur(&xyb[c], h, &mut mu[c]);
@@ -552,6 +505,7 @@ impl PreparedReference {
                 mu,
                 sigma,
             });
+            (pw, ph) = (w, h);
         }
         Ok(Self {
             data: Arc::new(ReferenceData {
@@ -594,7 +548,7 @@ impl PreparedReference {
         let mut lin = test.to_linear()?;
         let mut blur = GaussianBlur::with_kernel(w0, *kernel(), true);
         let mut moments: [Vec<f32>; 3] = Default::default();
-        let mut maps: [Vec<f32>; 3] = Default::default();
+        let mut ssim = Vec::new();
         let mut acc = Vec::new();
         let mut map = if want_map {
             vec![0f32; w0 * h0]
@@ -612,13 +566,22 @@ impl PreparedReference {
             }
             let xyb = positive_xyb_of_linear(&lin);
             blur.set_width(w);
-            for buffer in moments.iter_mut().chain(&mut maps) {
+            for buffer in &mut moments {
                 buffer.resize(w * h, 0.0);
             }
-            if want_map {
+            if want_map && s > 0 {
                 acc.clear();
                 acc.resize(w * h, 0.0);
             }
+            // The finest scale already has the output's resolution. Accumulate
+            // it directly, so the temporary accumulator starts at the next scale.
+            let mut scale_acc = if !want_map {
+                None
+            } else if s == 0 {
+                Some(&mut map[..])
+            } else {
+                Some(&mut acc[..])
+            };
             for c in 0..3 {
                 let active = active_maps(c, s, d.scales.len());
                 if !active.contains(&true) {
@@ -627,31 +590,44 @@ impl PreparedReference {
                 let (src, rec) = (&reference.xyb[c], &xyb[c]);
                 let (mu1, s11) = (&reference.mu[c], &reference.sigma[c]);
                 let [mu2, s22, s12] = &mut moments;
-                let [ssim, artifact, detail] = &mut maps;
-                blur.blur(rec, h, mu2);
                 // The finest X/B scales only weight edge maps; the variance
                 // and covariance blurs cannot affect the score there.
                 if active[0] {
-                    blur.blur_product([rec, rec], h, s22);
-                    blur.blur_product([src, rec], h, s12);
-                    for (i, out) in ssim.iter_mut().enumerate() {
-                        *out = ssim_value(mu1[i], mu2[i], s11[i], s22[i], s12[i]);
-                    }
-                }
-                for (i, (artifact, detail)) in
-                    artifact.iter_mut().zip(detail.iter_mut()).enumerate()
-                {
-                    let d1 = edge_ratio(src[i], rec[i], mu1[i], mu2[i]);
-                    *artifact = d1.max(0.0);
-                    *detail = (-d1).max(0.0);
+                    blur.blur_moments([src, rec], h, [mu2, s22, s12]);
+                    ssim.resize(w * h, 0.0);
+                    compute_map(MapKind::Ssim, [mu1, mu2, s11, s22, s12], &mut ssim);
+                } else {
+                    blur.blur(rec, h, mu2);
                 }
                 let base = weight_base(c, s, d.scales.len());
-                for (m, values) in [&*ssim, &*artifact, &*detail].into_iter().enumerate() {
-                    let acc = want_map.then_some(&mut acc[..]);
-                    sum += pool(values, WEIGHTS[base + m], WEIGHTS[base + 3 + m], acc);
+                sum += pool(
+                    &ssim,
+                    WEIGHTS[base],
+                    WEIGHTS[base + 3],
+                    scale_acc.as_deref_mut(),
+                );
+                // Variance/covariance are no longer needed after SSIM. Reuse
+                // those planes for the edge maps instead of retaining more buffers.
+                let (artifact, detail) = (s22, s12);
+                let edge_inputs = [&src[..], &rec[..], &mu1[..], &mu2[..], &src[..]];
+                if active[1] && active[2] {
+                    compute_edge_maps(edge_inputs, [artifact, detail]);
+                } else if active[1] {
+                    compute_map(MapKind::Artifact, edge_inputs, artifact);
+                } else if active[2] {
+                    compute_map(MapKind::Detail, edge_inputs, detail);
+                }
+                for (m, values) in [artifact, detail].into_iter().enumerate() {
+                    let acc = scale_acc.as_deref_mut();
+                    sum += pool(
+                        values,
+                        WEIGHTS[base + m + 1],
+                        WEIGHTS[base + 3 + m + 1],
+                        acc,
+                    );
                 }
             }
-            if want_map {
+            if want_map && s > 0 {
                 accumulate_scale_map(&acc, w0, h0, s, &mut map);
             }
         }
@@ -669,23 +645,15 @@ impl PreparedReference {
 mod tests {
     use super::*;
 
-    fn test_kernels() -> [(&'static str, MapKernels, bool); 2] {
+    fn test_kernels() -> Vec<(&'static str, MapKernels, bool)> {
         let selected = map_kernels();
-        let fused = cfg!(all(target_arch = "aarch64", feature = "neon")) || {
-            #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-            {
-                std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
-            }
-            #[cfg(not(all(target_arch = "x86_64", feature = "avx")))]
-            {
-                false
-            }
-        };
-        [
+        #[allow(unused_mut)]
+        let mut all = vec![
             (
                 "portable",
                 MapKernels {
                     contribution: contribution_scalar,
+                    fused: false,
                     expand: [
                         expand_row_scalar::<1>,
                         expand_row_scalar::<2>,
@@ -701,11 +669,59 @@ mod tests {
                 "dispatch",
                 MapKernels {
                     contribution: selected.contribution,
+                    fused: selected.fused,
                     expand: selected.expand,
                 },
-                fused,
+                selected.fused,
             ),
-        ]
+        ];
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+        if std::is_x86_feature_detected!("sse4.1") {
+            all.push((
+                "sse4.1",
+                MapKernels {
+                    contribution: crate::sse::ss2_contribution_sse41,
+                    fused: false,
+                    expand: [
+                        crate::sse::ss2_expand_row_sse41::<1>,
+                        crate::sse::ss2_expand_row_sse41::<2>,
+                        crate::sse::ss2_expand_row_sse41::<4>,
+                        crate::sse::ss2_expand_row_sse41::<8>,
+                        crate::sse::ss2_expand_row_sse41::<16>,
+                        crate::sse::ss2_expand_row_sse41::<32>,
+                    ],
+                },
+                false,
+            ));
+        }
+        all
+    }
+
+    #[test]
+    fn row_contributions_match_whole_map_with_global_normalization() {
+        for (w, h) in [(1, 9), (7, 11), (17, 19), (65, 3)] {
+            let map: Vec<_> = (0..w * h)
+                .map(|i| [0.0, -0.0, 1e-8, 0.1, 3.0, 1e4][i % 6])
+                .collect();
+            for n4 in [0.0, 1.25, 1e-40, 1e40] {
+                for (w1, w4) in [(1.0, 0.0), (0.0, 2.0), (0.3, 0.5)] {
+                    let mut whole = vec![0.001; map.len()];
+                    let mut rows = whole.clone();
+                    add_map_contribution(&map, w1, w4, n4, &mut whole);
+                    let coefficient = PooledContribution::new(map.len(), w1, w4, n4);
+                    for (src, dst) in map.chunks_exact(w).zip(rows.chunks_exact_mut(w)) {
+                        coefficient.add(src, dst);
+                    }
+                    for (a, b) in whole.iter().zip(rows) {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{w}x{h}, norm={n4}, weights={w1}/{w4}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -778,10 +794,18 @@ mod tests {
                                 let normalized = v * p.inv_norm;
                                 let square = normalized * normalized;
                                 let expected = if norm_weight == 0.0 {
-                                    p.linear.mul_add(v, initial[i])
+                                    if fused {
+                                        p.linear.mul_add(v, initial[i])
+                                    } else {
+                                        initial[i] + p.linear * v
+                                    }
                                 } else {
                                     initial[i]
-                                        + (norm_weight * square).mul_add(square, p.linear * v)
+                                        + if fused {
+                                            (norm_weight * square).mul_add(square, p.linear * v)
+                                        } else {
+                                            p.linear * v + norm_weight * square * square
+                                        }
                                 };
                                 assert_eq!(actual[i].to_bits(), expected.to_bits());
                             }
@@ -858,52 +882,6 @@ mod tests {
                         assert_eq!(actual, expected, "scale={scale}, {width}x{height}");
                     }
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn replacement_tails_update_fourth_powers_and_revert() {
-        let totals = |values: &[f32]| {
-            values.iter().fold((0.0, 0.0), |(s1, s4), &v| {
-                let v = v as f64;
-                (s1 + v, s4 + v.powi(4))
-            })
-        };
-        for n in (0..=65).chain([127, 129, 257]) {
-            let old: Vec<_> = (0..n).map(|i| (i % 23) as f32 / 16.0).collect();
-            let new: Vec<_> = (0..n).map(|i| (i % 29) as f32 / 32.0).collect();
-            for fourth in [false, true] {
-                let expected = |values: &[f32]| {
-                    let (s1, s4) = totals(values);
-                    (s1, if fourth { s4 } else { 0.0 })
-                };
-                let mut map = old.clone();
-                let mut sums = expected(&old);
-                replace_map(&mut map, [&new], &mut sums, fourth, |[v]| v);
-                assert_eq!(map, new);
-                assert_eq!(sums, expected(&new), "n={n}, fourth={fourth}");
-                replace_map(&mut map, [&old], &mut sums, fourth, |[v]| v);
-                assert_eq!(map, old);
-                assert_eq!(sums, expected(&old), "n={n}, fourth={fourth}");
-            }
-        }
-    }
-
-    #[test]
-    fn first_norm_reduction_matches_full_reduction_across_tails_and_hdr_values() {
-        for n in (0..=65).chain([127, 129, 4099, 307_200]) {
-            for magnitude in [0.0, 1e-35, 1e-7, 1.0, 1e20, 1e37] {
-                let map: Vec<_> = (0..n)
-                    .map(|i| magnitude * ((i % 17 + 1) as f32 / 17.0))
-                    .collect();
-                let mut actual = vec![0.0; n];
-                let mut first = (0.0, 0.0);
-                replace_map(&mut actual, [&map], &mut first, false, |[v]| v);
-                let both = map_sums(&map);
-                assert_eq!(actual, map);
-                assert_eq!(first.0.to_bits(), both.0.to_bits());
-                assert_eq!(first.1, 0.0);
             }
         }
     }

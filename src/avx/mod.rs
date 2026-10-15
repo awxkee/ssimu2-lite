@@ -29,10 +29,17 @@
 
 mod blur;
 mod downsample;
+mod image;
 mod metric;
 mod xyb;
 
-pub(crate) use blur::{blur_horizontal_avx2, blur_vertical_avx2};
+pub(crate) use blur::{
+    blur_horizontal_avx2, blur_moment_horizontal_avx2, blur_moment_row_avx2,
+    blur_moment_vertical_avx2, blur_product_row_avx2, blur_vertical_avx2,
+};
 pub(crate) use downsample::downsample_rows_avx2;
-pub(crate) use metric::{ss2_contribution_avx2, ss2_expand_row_avx2};
+pub(crate) use image::has_non_finite_avx2;
+pub(crate) use metric::{
+    ss2_contribution_avx2, ss2_edges_avx2, ss2_expand_row_avx2, ss2_map_avx2, ss2_sums_avx2,
+};
 pub(crate) use xyb::xyb_rows_avx2;

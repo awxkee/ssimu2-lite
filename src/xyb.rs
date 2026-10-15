@@ -73,12 +73,15 @@ fn opsin_pixel(r: f32, g: f32, b: f32) -> [f32; 3] {
     [0.5 * (l - m_), 0.5 * (l + m_), s]
 }
 
-/// Row kernels convert to plain XYB and return how many pixels they handled.
+/// Row kernels convert to positive XYB and return how many pixels they handled.
 pub(crate) type XybRowsFn = unsafe fn([&[f32]; 3], [&mut [f32]; 3]) -> usize;
 
 fn xyb_rows_scalar([r, g, b]: [&[f32]; 3], [x, y, out_b]: [&mut [f32]; 3]) -> usize {
     for i in 0..x.len() {
-        [x[i], y[i], out_b[i]] = opsin_pixel(r[i], g[i], b[i]);
+        let [px, py, pb] = opsin_pixel(r[i], g[i], b[i]);
+        x[i] = px * 14.0 + 0.42;
+        y[i] = py + 0.01;
+        out_b[i] = (pb - py) + 0.55;
     }
     x.len()
 }
@@ -96,9 +99,10 @@ fn selected_xyb_rows() -> XybRowsFn {
             return crate::sse::xyb_rows_sse41;
         }
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            return crate::neon::xyb_rows_neon;
+        {
+            crate::neon::xyb_rows_neon
         }
+        #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
         xyb_rows_scalar
     })
 }
@@ -116,11 +120,6 @@ pub(crate) fn positive_xyb_into(lin: [&[f32]; 3], [x, y, b]: [&mut [f32]; 3]) {
         lin.map(|p| &p[done..]),
         [&mut x[done..], &mut y[done..], &mut b[done..]],
     );
-    for ((x, y), b) in x.iter_mut().zip(y.iter_mut()).zip(b.iter_mut()) {
-        *x = *x * 14.0 + 0.42;
-        *b = (*b - *y) + 0.55;
-        *y += 0.01;
-    }
 }
 
 pub(crate) fn positive_xyb_of_linear(lin: &[Vec<f32>; 3]) -> [Vec<f32>; 3] {
@@ -150,11 +149,6 @@ mod tests {
             positive_xyb_into(input, [a, b, c]);
             let [a, b, c] = &mut scalar;
             xyb_rows_scalar(input, [&mut a[..], &mut b[..], &mut c[..]]);
-            for i in 0..n {
-                a[i] = a[i] * 14.0 + 0.42;
-                c[i] = (c[i] - b[i]) + 0.55;
-                b[i] += 0.01;
-            }
             for (s, v) in simd.iter().zip(&scalar) {
                 for (p, q) in s.iter().zip(v) {
                     assert!((p - q).abs() <= 1e-5, "{n}: {p} vs {q}");

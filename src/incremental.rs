@@ -29,16 +29,17 @@
 
 //! Region-incremental scoring for encoder loops that change one area of a
 //! test image at a time. The state keeps the test image's linear and XYB
-//! pyramids, its blurred moments, every weighted map and the pooled sums. An
-//! update recomputes only the changed area (plus the blur halo) at every
-//! scale and adjusts the sums; the score then costs a few hundred flops.
+//! pyramids, every weighted map and the pooled sums. Blurred test moments use
+//! reusable region scratch. An update recomputes only the changed area
+//! (plus the blur halo) at every scale and adjusts the sums; the score
+//! then costs a few hundred flops.
 
 use crate::blur::GaussianBlur;
 use crate::downsample::downsample_rows;
+use crate::maps::{MapKind, replace_edge_maps, replace_map};
 use crate::metric::{
-    PreparedReference, RADIUS, ReferenceData, WEIGHTS, accumulate_scale_map, active_maps,
-    add_map_contribution, deficit_slope, edge_ratio, kernel, replace_map, score_from_sum,
-    ssim_value, weight_base,
+    PooledContribution, PreparedReference, RADIUS, ReferenceData, WEIGHTS, accumulate_scale_map,
+    active_maps, deficit_slope, kernel, score_from_sum, weight_base,
 };
 use crate::xyb::positive_xyb_into;
 use crate::{Error, RgbImage};
@@ -85,11 +86,11 @@ impl Rect {
     }
 }
 
-/// Everything one [`IncrementalState::update_checkpointed`] overwrote.
+/// Saved image planes, maps and sums for [`IncrementalState::update_checkpointed`].
 /// Reuse one checkpoint across candidates to keep its allocation.
 #[derive(Default)]
 pub struct Checkpoint {
-    rects: Vec<(Rect, Rect)>,
+    rect: Option<Rect>,
     data: Vec<f32>,
     sums: Vec<[[(f64, f64); 3]; 3]>,
 }
@@ -125,11 +126,8 @@ pub struct IncrementalState {
     lin: Vec<[Vec<f32>; 3]>,
     /// Test image's positive XYB planes per scale.
     xyb: Vec<[Vec<f32>; 3]>,
-    /// Blurred test moments per scale and plane. Unweighted planes are empty;
-    /// squared/cross moments are empty unless the SSIM map is weighted.
-    mu2: Vec<[Vec<f32>; 3]>,
-    s22: Vec<[Vec<f32>; 3]>,
-    s12: Vec<[Vec<f32>; 3]>,
+    /// Reused region-sized mean, square and cross-product scratch.
+    moments: [Vec<f32>; 3],
     /// Maps per scale, plane: ssim, artifact, detail. Unweighted maps are empty.
     maps: Vec<[[Vec<f32>; 3]; 3]>,
     /// Pooled sums per scale, plane, map: (Σx, Σx⁴). Unweighted fourth sums
@@ -147,18 +145,16 @@ impl IncrementalState {
             return Err(Error::DimensionMismatch);
         }
         let mut lin = test.to_linear()?;
+        let scales = data.scales.len();
         let mut st = IncrementalState {
             blur: GaussianBlur::with_kernel(data.width, *kernel(), true),
             reference: data,
-            lin: Vec::new(),
-            xyb: Vec::new(),
-            mu2: Vec::new(),
-            s22: Vec::new(),
-            s12: Vec::new(),
-            maps: Vec::new(),
-            sums: Vec::new(),
+            lin: Vec::with_capacity(scales),
+            xyb: Vec::with_capacity(scales),
+            moments: Default::default(),
+            maps: Vec::with_capacity(scales),
+            sums: Vec::with_capacity(scales),
         };
-        let scales = st.reference.scales.len();
         for s in 0..scales {
             let (w, h) = st.dims(s);
             if s > 0 {
@@ -177,29 +173,15 @@ impl IncrementalState {
             st.xyb.push(xyb);
             let active: [[bool; 3]; 3] = std::array::from_fn(|c| active_maps(c, s, scales));
             let buffer = |needed| if needed { vec![0.0; n] } else { Vec::new() };
-            st.mu2
-                .push(std::array::from_fn(|c| buffer(active[c].contains(&true))));
-            st.s22.push(std::array::from_fn(|c| buffer(active[c][0])));
-            st.s12.push(std::array::from_fn(|c| buffer(active[c][0])));
             st.maps.push(std::array::from_fn(|c| {
                 std::array::from_fn(|m| buffer(active[c][m]))
             }));
             st.sums.push([[(0.0, 0.0); 3]; 3]);
-            st.blur.set_width(w);
-            for c in 0..3 {
-                if !active[c].contains(&true) {
-                    continue;
-                }
-                let rec = &st.xyb[s][c];
-                st.blur.blur(rec, h, &mut st.mu2[s][c]);
-                if active[c][0] {
-                    let src = &st.reference.scales[s].xyb[c];
-                    st.blur.blur_product([rec, rec], h, &mut st.s22[s][c]);
-                    st.blur.blur_product([src, rec], h, &mut st.s12[s][c]);
-                }
-            }
-            st.refresh_maps(s, Rect::new(0, 0, w, h));
+            st.refresh_moments_and_maps(s, Rect::new(0, 0, w, h));
         }
+        // Initialization covers whole scales; local updates should retain only
+        // the scratch they actually need, rather than these full-frame buffers.
+        st.moments = Default::default();
         Ok(st)
     }
 
@@ -229,8 +211,9 @@ impl IncrementalState {
         if r.is_empty() {
             return;
         }
-        self.blur.set_width(r.x1 - r.x0);
-        let offset = r.y0 * w + r.x0;
+        let rw = r.x1 - r.x0;
+        let n = rw * (r.y1 - r.y0);
+        self.blur.set_width(rw);
         let region = [r.x0..r.x1, r.y0..r.y1];
         for c in 0..3 {
             let active = active_maps(c, s, self.scales());
@@ -239,99 +222,103 @@ impl IncrementalState {
             }
             let rec = &self.xyb[s][c];
             let src = &self.reference.scales[s].xyb[c];
-            self.blur
-                .blur_region(rec, w, h, region.clone(), &mut self.mu2[s][c][offset..], w);
-            if !active[0] {
-                continue;
+            let [mu2, s22, s12] = &mut self.moments;
+            if mu2.len() < n {
+                mu2.resize(n, 0.0);
             }
-            self.blur.blur_product_region(
-                [rec, rec],
-                w,
-                h,
-                region.clone(),
-                &mut self.s22[s][c][offset..],
-                w,
-            );
-            self.blur.blur_product_region(
-                [src, rec],
-                w,
-                h,
-                region.clone(),
-                &mut self.s12[s][c][offset..],
-                w,
-            );
+            if active[0] {
+                for buffer in [&mut *s22, &mut *s12] {
+                    if buffer.len() < n {
+                        buffer.resize(n, 0.0);
+                    }
+                }
+                self.blur.blur_moments_region(
+                    [src, rec],
+                    w,
+                    h,
+                    region.clone(),
+                    [&mut mu2[..n], &mut s22[..n], &mut s12[..n]],
+                    rw,
+                );
+            } else {
+                self.blur
+                    .blur_region(rec, w, h, region.clone(), &mut mu2[..n], rw);
+            }
+            self.refresh_maps(s, c, r);
         }
-        self.refresh_maps(s, r);
     }
 
     /// Recompute the weighted maps over `r` from their current moments.
-    fn refresh_maps(&mut self, s: usize, r: Rect) {
+    fn refresh_maps(&mut self, s: usize, c: usize, r: Rect) {
         let (w, _) = self.dims(s);
         let reference = &self.reference.scales[s];
-        for c in 0..3 {
-            let active = active_maps(c, s, self.scales());
-            if !active.contains(&true) {
-                continue;
+        let active = active_maps(c, s, self.scales());
+        let base = weight_base(c, s, self.scales());
+        let need_fourth: [bool; 3] = std::array::from_fn(|m| WEIGHTS[base + 3 + m] != 0.0);
+        let rec = &self.xyb[s][c];
+        let src = &reference.xyb[c];
+        let mu1 = &reference.mu[c];
+        let s11 = &reference.sigma[c];
+        let [mu2, s22, s12] = &self.moments;
+        let [ssim, artifact, detail] = &mut self.maps[s][c];
+        for y in r.y0..r.y1 {
+            let span = y * w + r.x0..y * w + r.x1;
+            let start = (y - r.y0) * (r.x1 - r.x0);
+            let scratch = start..start + r.x1 - r.x0;
+            if active[0] {
+                replace_map(
+                    MapKind::Ssim,
+                    [
+                        &mu1[span.clone()],
+                        &mu2[scratch.clone()],
+                        &s11[span.clone()],
+                        &s22[scratch.clone()],
+                        &s12[scratch.clone()],
+                    ],
+                    &mut ssim[span.clone()],
+                    &mut self.sums[s][c][0],
+                    need_fourth[0],
+                );
             }
-            let base = weight_base(c, s, self.scales());
-            let need_fourth: [bool; 3] = std::array::from_fn(|m| WEIGHTS[base + 3 + m] != 0.0);
-            let rec = &self.xyb[s][c];
-            let src = &reference.xyb[c];
-            let mu1 = &reference.mu[c];
-            let s11 = &reference.sigma[c];
-            let mu2 = &self.mu2[s][c];
-            let s22 = &self.s22[s][c];
-            let s12 = &self.s12[s][c];
-            let [ssim, artifact, detail] = &mut self.maps[s][c];
-            for y in r.y0..r.y1 {
-                let span = y * w + r.x0..y * w + r.x1;
-                if active[0] {
-                    replace_map(
-                        &mut ssim[span.clone()],
-                        [
-                            &mu1[span.clone()],
-                            &mu2[span.clone()],
-                            &s11[span.clone()],
-                            &s22[span.clone()],
-                            &s12[span.clone()],
-                        ],
-                        &mut self.sums[s][c][0],
-                        need_fourth[0],
-                        |[m1, m2, v11, v22, v12]| ssim_value(m1, m2, v11, v22, v12),
-                    );
-                }
-                let inputs = [
-                    &src[span.clone()],
-                    &rec[span.clone()],
-                    &mu1[span.clone()],
-                    &mu2[span.clone()],
-                ];
-                if active[1] {
-                    replace_map(
-                        &mut artifact[span.clone()],
-                        inputs,
-                        &mut self.sums[s][c][1],
-                        need_fourth[1],
-                        |[a, b, m1, m2]| edge_ratio(a, b, m1, m2).max(0.0),
-                    );
-                }
-                if active[2] {
-                    replace_map(
-                        &mut detail[span],
-                        inputs,
-                        &mut self.sums[s][c][2],
-                        need_fourth[2],
-                        |[a, b, m1, m2]| (-edge_ratio(a, b, m1, m2)).max(0.0),
-                    );
-                }
+            let inputs = [
+                &src[span.clone()],
+                &rec[span.clone()],
+                &mu1[span.clone()],
+                &mu2[scratch.clone()],
+                &src[span.clone()],
+            ];
+            if active[1] && active[2] {
+                let [_, artifact_sum, detail_sum] = &mut self.sums[s][c];
+                replace_edge_maps(
+                    inputs,
+                    [&mut artifact[span.clone()], &mut detail[span]],
+                    [artifact_sum, detail_sum],
+                    [need_fourth[1], need_fourth[2]],
+                );
+            } else if active[1] {
+                replace_map(
+                    MapKind::Artifact,
+                    inputs,
+                    &mut artifact[span],
+                    &mut self.sums[s][c][1],
+                    need_fourth[1],
+                );
+            } else if active[2] {
+                replace_map(
+                    MapKind::Detail,
+                    inputs,
+                    &mut detail[span],
+                    &mut self.sums[s][c][2],
+                    need_fourth[2],
+                );
             }
-            // Maps are nonnegative: an exact zero first sum implies a zero
-            // fourth sum. Clear residual round-off after a candidate revert;
-            // the fourth root would otherwise amplify it near a perfect match.
-            for sums in &mut self.sums[s][c] {
-                if sums.0 == 0.0 {
-                    sums.1 = 0.0;
-                }
+        }
+        // Maps are nonnegative: an exact zero first sum implies a zero
+        // fourth sum. Clear residual round-off after a candidate revert;
+        // the fourth root would otherwise amplify it near a perfect match.
+        for sums in &mut self.sums[s][c] {
+            if sums.0 == 0.0 {
+                sums.1 = 0.0;
             }
         }
     }
@@ -419,21 +406,17 @@ impl IncrementalState {
 
     /// Per scale, the rect `update` rewrites in the image planes and the
     /// (blur-expanded) rect it rewrites in moments and maps.
-    fn update_rects(&self, rect: Rect) -> Vec<(Rect, Rect)> {
-        let r0 = rect.clamp(self.width(), self.height());
-        let mut out = Vec::with_capacity(self.lin.len());
-        if r0.is_empty() {
-            return out;
-        }
-        let mut rs = r0;
-        for s in 0..self.lin.len() {
-            let (w, h) = self.dims(s);
+    fn update_rects(&self, rect: Rect) -> impl Iterator<Item = (Rect, Rect)> + use<> {
+        let (mut w, mut h) = (self.width(), self.height());
+        let mut rs = rect.clamp(w, h);
+        let scales = if rs.is_empty() { 0 } else { self.scales() };
+        (0..scales).map(move |s| {
             if s > 0 {
+                (w, h) = (w.div_ceil(2), h.div_ceil(2));
                 rs = rs.half(w, h);
             }
-            out.push((rs, rs.expand(RADIUS, w, h)));
-        }
-        out
+            (rs, rs.expand(RADIUS, w, h))
+        })
     }
 
     /// [`update`](Self::update), first saving everything it overwrites into
@@ -450,24 +433,42 @@ impl IncrementalState {
         }
         let cp = checkpoint;
         cp.data.clear();
-        cp.rects = self.update_rects(rect);
+        cp.rect = None;
+        let rect = rect.clamp(self.width(), self.height());
+        if rect.is_empty() {
+            return Ok(());
+        }
+        cp.rect = Some(rect);
         cp.sums.clone_from(&self.sums);
-        for (s, &(rs, region)) in cp.rects.iter().enumerate() {
+        let needed = self
+            .update_rects(rect)
+            .enumerate()
+            .map(|(s, (rs, region))| {
+                let pixels = (rs.x1 - rs.x0) * (rs.y1 - rs.y0);
+                let halo = (region.x1 - region.x0) * (region.y1 - region.y0);
+                let maps = self.maps[s]
+                    .iter()
+                    .flatten()
+                    .filter(|p| !p.is_empty())
+                    .count();
+                6 * pixels + maps * halo
+            })
+            .sum();
+        cp.data.reserve_exact(needed);
+        for (s, (rs, region)) in self.update_rects(rect).enumerate() {
             let w = self.dims(s).0;
             for c in 0..3 {
                 save_rows(&self.lin[s][c], w, rs, &mut cp.data);
                 save_rows(&self.xyb[s][c], w, rs, &mut cp.data);
-                for buf in [&self.mu2[s][c], &self.s22[s][c], &self.s12[s][c]] {
-                    save_rows(buf, w, region, &mut cp.data);
-                }
                 for map in &self.maps[s][c] {
                     save_rows(map, w, region, &mut cp.data);
                 }
             }
         }
+        debug_assert_eq!(cp.data.len(), needed);
         let result = self.update(test, rect);
         if result.is_err() {
-            cp.rects.clear();
+            cp.rect = None;
             cp.data.clear();
         }
         result
@@ -476,23 +477,21 @@ impl IncrementalState {
     /// Undoes the `update_checkpointed` that filled `checkpoint`.
     pub fn rollback(&mut self, checkpoint: &Checkpoint) {
         let cp = checkpoint;
-        if cp.rects.is_empty() {
+        let Some(rect) = cp.rect else {
             return;
-        }
+        };
         let mut at = 0usize;
-        for (s, &(rs, region)) in cp.rects.iter().enumerate() {
+        for (s, (rs, region)) in self.update_rects(rect).enumerate() {
             let w = self.dims(s).0;
             for c in 0..3 {
                 at = load_rows(&mut self.lin[s][c], w, rs, &cp.data, at);
                 at = load_rows(&mut self.xyb[s][c], w, rs, &cp.data, at);
-                at = load_rows(&mut self.mu2[s][c], w, region, &cp.data, at);
-                at = load_rows(&mut self.s22[s][c], w, region, &cp.data, at);
-                at = load_rows(&mut self.s12[s][c], w, region, &cp.data, at);
                 for m in 0..3 {
                     at = load_rows(&mut self.maps[s][c][m], w, region, &cp.data, at);
                 }
             }
         }
+        debug_assert_eq!(at, cp.data.len());
         self.sums.clone_from(&cp.sums);
     }
 
@@ -502,29 +501,42 @@ impl IncrementalState {
         let (w0, h0) = (self.width(), self.height());
         let mut map = vec![0f32; w0 * h0];
         let sum = self.weighted_sum();
-        let mut acc = Vec::new();
+        // A small row block keeps SIMD loops long without a full-frame accumulator.
+        const ROWS: usize = 16;
+        let mut acc = vec![0.0; w0 * ROWS.min(h0)];
         for s in 0..self.sums.len() {
             let (w, h) = self.dims(s);
-            let n = (w * h) as f64;
-            acc.clear();
-            acc.resize(w * h, 0.0);
-            for c in 0..3 {
+            let pixels = w * h;
+            let coefficients: [[Option<PooledContribution>; 3]; 3] = std::array::from_fn(|c| {
                 let base = weight_base(c, s, self.scales());
-                for m in 0..3 {
-                    if WEIGHTS[base + m] == 0.0 && WEIGHTS[base + 3 + m] == 0.0 {
-                        continue;
+                std::array::from_fn(|m| {
+                    let (w1, w4) = (WEIGHTS[base + m], WEIGHTS[base + 3 + m]);
+                    if w1 == 0.0 && w4 == 0.0 {
+                        None
+                    } else {
+                        let n4 = (self.sums[s][c][m].1 / pixels as f64)
+                            .max(0.0)
+                            .sqrt()
+                            .sqrt();
+                        Some(PooledContribution::new(pixels, w1, w4, n4))
                     }
-                    let n4 = (self.sums[s][c][m].1 / n).max(0.0).sqrt().sqrt();
-                    add_map_contribution(
-                        &self.maps[s][c][m],
-                        WEIGHTS[base + m],
-                        WEIGHTS[base + 3 + m],
-                        n4,
-                        &mut acc,
-                    );
+                })
+            });
+            let output_rows = (ROWS * (1 << s)).min(h0);
+            for (block, rows) in map.chunks_mut(w0 * output_rows).enumerate() {
+                let start = block * ROWS * w;
+                let end = start + ROWS.min(h - block * ROWS) * w;
+                let acc = &mut acc[..end - start];
+                acc.fill(0.0);
+                for (maps, coefficients) in self.maps[s].iter().zip(coefficients) {
+                    for (values, coefficient) in maps.iter().zip(coefficients) {
+                        if let Some(coefficient) = coefficient {
+                            coefficient.add(&values[start..end], acc);
+                        }
+                    }
                 }
+                accumulate_scale_map(acc, w0, rows.len() / w0, s, rows);
             }
-            accumulate_scale_map(&acc, w0, h0, s, &mut map);
         }
         let factor = deficit_slope(sum) as f32 * (w0 * h0) as f32;
         for v in &mut map {
@@ -538,7 +550,8 @@ impl IncrementalState {
 mod state_tests {
     use super::*;
     use crate::Error;
-    use crate::metric::{MapContribution, contribution_scalar, map_sums};
+    use crate::maps::map_sums;
+    use crate::metric::{MapContribution, contribution_scalar};
     use crate::testing::{Planes, full, state_of};
 
     fn textured(seed: u32, w: usize, h: usize) -> Planes {
@@ -808,20 +821,18 @@ mod state_tests {
                     {
                         assert_eq!(actual, expected, "linear pyramid: {w}x{h}, {r:?}");
                     }
-                    for (actual, expected) in [&state.mu2, &state.s22, &state.s12]
-                        .into_iter()
-                        .zip([&fresh.mu2, &fresh.s22, &fresh.s12])
+                    for (actual, expected) in state
+                        .maps
+                        .iter()
+                        .flatten()
+                        .flatten()
+                        .zip(fresh.maps.iter().flatten().flatten())
                     {
-                        for (a, b) in actual
-                            .iter()
-                            .flatten()
-                            .flatten()
-                            .zip(expected.iter().flatten().flatten())
-                        {
+                        for (a, b) in actual.iter().zip(expected) {
                             assert_eq!(
                                 a.to_bits(),
                                 b.to_bits(),
-                                "moments: {w}x{h}, {r:?}: {a} vs {b}"
+                                "maps: {w}x{h}, {r:?}: {a} vs {b}"
                             );
                         }
                     }
@@ -916,6 +927,52 @@ mod state_tests {
                 .unwrap();
             assert_eq!(state.deficit(), 0.0);
             assert!(state.error_map().iter().all(|&v| v == 0.0));
+        }
+    }
+
+    #[test]
+    fn local_scratch_and_checkpoint_buffers_are_reused() {
+        let (w, h) = (257, 259);
+        let src = textured(7, w, h);
+        let rec = textured(8, w, h);
+        let mut state = state_of(&src, &rec);
+        assert!(state.moments.iter().all(|p| p.capacity() == 0));
+        let before = state.score().to_bits();
+        let map_before = state.error_map();
+        let mut cp = Checkpoint::default();
+        let largest = Rect::new(103, 77, 135, 109);
+        state
+            .update_checkpointed(src.image(), largest, &mut cp)
+            .unwrap();
+        state.rollback(&cp);
+        let checkpoint_layout = (cp.data.as_ptr(), cp.data.capacity(), cp.sums.as_ptr());
+        let moments = state.moments.each_ref().map(|p| (p.as_ptr(), p.capacity()));
+        assert!(
+            state
+                .moments
+                .iter()
+                .all(|p| p.len() <= (32 + 2 * RADIUS).pow(2))
+        );
+        assert!(cp.data.capacity() < w * h);
+        for r in [
+            largest,
+            Rect::new(w - 7, h - 5, w + 9, h + 7),
+            Rect::new(0, 0, 1, 1),
+            Rect::new(w, h, w + 1, h + 1),
+            Rect::new(10, 12, 5, 7),
+        ] {
+            state.update_checkpointed(src.image(), r, &mut cp).unwrap();
+            state.rollback(&cp);
+            assert_eq!(state.score().to_bits(), before);
+            assert_eq!(state.error_map(), map_before);
+            assert_eq!(
+                (cp.data.as_ptr(), cp.data.capacity(), cp.sums.as_ptr()),
+                checkpoint_layout
+            );
+            assert_eq!(
+                state.moments.each_ref().map(|p| (p.as_ptr(), p.capacity())),
+                moments
+            );
         }
     }
 

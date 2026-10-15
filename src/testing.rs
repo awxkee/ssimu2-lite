@@ -86,3 +86,48 @@ pub(crate) fn state_of(src: &Planes, rec: &Planes) -> IncrementalState {
         .incremental(rec.image())
         .unwrap()
 }
+
+/// SIMD CI jobs must exercise their backend instead of silently falling back
+/// to scalar when the runner lacks a CPU feature or a Cargo feature is missing.
+#[test]
+fn required_simd_backend_is_available() {
+    let Some(required) = std::env::var_os("SSIMU2_REQUIRE_SIMD") else {
+        return;
+    };
+    let required = required
+        .to_str()
+        .expect("SSIMU2_REQUIRE_SIMD must be UTF-8");
+    let available = match required {
+        "avx2" => {
+            #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+            {
+                std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+            }
+            #[cfg(not(all(target_arch = "x86_64", feature = "avx")))]
+            {
+                false
+            }
+        }
+        "sse4.1" => {
+            #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+            {
+                std::is_x86_feature_detected!("sse4.1")
+            }
+            #[cfg(not(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse")))]
+            {
+                false
+            }
+        }
+        "neon" => cfg!(all(target_arch = "aarch64", feature = "neon")),
+        _ => panic!("unknown SIMD backend requested: {required}"),
+    };
+    assert!(
+        available,
+        "required backend {required} is unavailable on {} (avx={}, sse={}, neon={}); \
+         AVX2 color/contribution kernels also require FMA",
+        std::env::consts::ARCH,
+        cfg!(feature = "avx"),
+        cfg!(feature = "sse"),
+        cfg!(feature = "neon"),
+    );
+}

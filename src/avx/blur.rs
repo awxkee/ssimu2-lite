@@ -27,14 +27,22 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 // Adapted from libblur's symmetric f32 filter1d kernels.
-use crate::blur::{BlurRows, RADIUS, WINDOW};
+use crate::blur::{BlurRows, MomentRows, RADIUS, WINDOW};
 use std::arch::x86_64::*;
 
 #[target_feature(enable = "avx2")]
 pub(crate) fn blur_horizontal_avx2(src: &[f32], k: &[f32; WINDOW], dst: &mut [f32]) -> usize {
     assert!(src.len() >= dst.len() + 2 * RADIUS);
     let done = horizontal::<4>(src, k, dst);
-    done + horizontal::<1>(&src[done..], k, &mut dst[done..])
+    let done = done + horizontal::<1>(&src[done..], k, &mut dst[done..]);
+    if done < dst.len() && done >= 8 {
+        // Recompute the last full vector to cover the short tail in bounds.
+        let start = dst.len() - 8;
+        horizontal::<1>(&src[start..], k, &mut dst[start..]);
+        dst.len()
+    } else {
+        done
+    }
 }
 
 #[inline]
@@ -42,11 +50,10 @@ pub(crate) fn blur_horizontal_avx2(src: &[f32], k: &[f32; WINDOW], dst: &mut [f3
 fn horizontal<const N: usize>(src: &[f32], k: &[f32; WINDOW], dst: &mut [f32]) -> usize {
     const LANES: usize = 8;
     let center = _mm256_set1_ps(k[RADIUS]);
-    let mut done = 0;
     let (vectors, _) = dst.as_chunks_mut::<LANES>();
     let (blocks, _) = vectors.as_chunks_mut::<N>();
+    let done = blocks.len() * N * LANES;
     for (block, dst) in blocks.iter_mut().enumerate() {
-        let dst = dst.as_flattened_mut();
         let x = block * N * LANES;
         // Bounds are validated above; every vector fits the padded row or
         // one of the WINDOW rows, and every store fits this output chunk.
@@ -57,19 +64,18 @@ fn horizontal<const N: usize>(src: &[f32], k: &[f32; WINDOW], dst: &mut [f32]) -
                     center,
                 )
             });
-            for i in 0..RADIUS {
-                let coeff = _mm256_set1_ps(k[i]);
+            for (i, &weight) in k[..RADIUS].iter().enumerate() {
+                let coeff = _mm256_set1_ps(weight);
                 for (lane, acc) in acc.iter_mut().enumerate() {
                     let a = _mm256_loadu_ps(src.as_ptr().add(x + lane * LANES + i));
                     let b = _mm256_loadu_ps(src.as_ptr().add(x + lane * LANES + WINDOW - 1 - i));
                     *acc = _mm256_add_ps(*acc, _mm256_mul_ps(_mm256_add_ps(a, b), coeff));
                 }
             }
-            for (lane, acc) in acc.into_iter().enumerate() {
-                _mm256_storeu_ps(dst.as_mut_ptr().add(lane * LANES), acc);
+            for (dst, acc) in dst.iter_mut().zip(acc) {
+                _mm256_storeu_ps(dst.as_mut_ptr(), acc);
             }
         }
-        done += N * LANES;
     }
     done
 }
@@ -78,7 +84,14 @@ fn horizontal<const N: usize>(src: &[f32], k: &[f32; WINDOW], dst: &mut [f32]) -
 pub(crate) fn blur_vertical_avx2(rows: &BlurRows<'_>, k: &[f32; WINDOW], dst: &mut [f32]) -> usize {
     assert!(rows.iter().all(|row| row.len() >= dst.len()));
     let done = vertical::<4>(rows, k, dst);
-    done + vertical::<1>(&rows.map(|row| &row[done..]), k, &mut dst[done..])
+    let done = done + vertical::<1>(&rows.map(|row| &row[done..]), k, &mut dst[done..]);
+    if done < dst.len() && done >= 8 {
+        let start = dst.len() - 8;
+        vertical::<1>(&rows.map(|row| &row[start..]), k, &mut dst[start..]);
+        dst.len()
+    } else {
+        done
+    }
 }
 
 #[inline]
@@ -86,11 +99,10 @@ pub(crate) fn blur_vertical_avx2(rows: &BlurRows<'_>, k: &[f32; WINDOW], dst: &m
 fn vertical<const N: usize>(rows: &BlurRows<'_>, k: &[f32; WINDOW], dst: &mut [f32]) -> usize {
     const LANES: usize = 8;
     let center = _mm256_set1_ps(k[RADIUS]);
-    let mut done = 0;
     let (vectors, _) = dst.as_chunks_mut::<LANES>();
     let (blocks, _) = vectors.as_chunks_mut::<N>();
+    let done = blocks.len() * N * LANES;
     for (block, dst) in blocks.iter_mut().enumerate() {
-        let dst = dst.as_flattened_mut();
         let x = block * N * LANES;
         // Bounds are validated above; every vector fits the padded row or
         // one of the WINDOW rows, and every store fits this output chunk.
@@ -101,19 +113,251 @@ fn vertical<const N: usize>(rows: &BlurRows<'_>, k: &[f32; WINDOW], dst: &mut [f
                     center,
                 )
             });
-            for i in 0..RADIUS {
-                let coeff = _mm256_set1_ps(k[i]);
+            for (i, &weight) in k[..RADIUS].iter().enumerate() {
+                let coeff = _mm256_set1_ps(weight);
                 for (lane, acc) in acc.iter_mut().enumerate() {
                     let a = _mm256_loadu_ps(rows[i].as_ptr().add(x + lane * LANES));
                     let b = _mm256_loadu_ps(rows[WINDOW - 1 - i].as_ptr().add(x + lane * LANES));
                     *acc = _mm256_add_ps(*acc, _mm256_mul_ps(_mm256_add_ps(a, b), coeff));
                 }
             }
-            for (lane, acc) in acc.into_iter().enumerate() {
-                _mm256_storeu_ps(dst.as_mut_ptr().add(lane * LANES), acc);
+            for (dst, acc) in dst.iter_mut().zip(acc) {
+                _mm256_storeu_ps(dst.as_mut_ptr(), acc);
             }
         }
-        done += N * LANES;
+    }
+    done
+}
+
+/// # Safety
+/// AVX2 must be available and all three slices must have equal lengths.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn blur_product_row_avx2([a, b]: [&[f32]; 2], dst: &mut [f32]) -> usize {
+    let (vectors, _) = dst.as_chunks_mut::<8>();
+    let done = vectors.len() * 8;
+    for ((dst, a), b) in vectors
+        .iter_mut()
+        .zip(a.as_chunks::<8>().0)
+        .zip(b.as_chunks::<8>().0)
+    {
+        // Equal lengths ensure that every complete vector is in bounds.
+        unsafe {
+            _mm256_storeu_ps(
+                dst.as_mut_ptr(),
+                _mm256_mul_ps(_mm256_loadu_ps(a.as_ptr()), _mm256_loadu_ps(b.as_ptr())),
+            );
+        }
+    }
+    done
+}
+
+/// # Safety
+/// AVX2 must be available, inputs must have equal lengths, and every
+/// output must match that length. Products round before filtering.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn blur_moment_row_avx2(
+    [reference, test]: [&[f32]; 2],
+    mut dst: [&mut [f32]; 3],
+) -> usize {
+    let n = dst[0].len();
+    let [mean, square, cross] = dst.each_mut().map(|p| p.as_chunks_mut::<8>().0);
+    let done = mean.len() * 8;
+    let reference_vectors = reference.as_chunks::<8>().0;
+    let test_vectors = test.as_chunks::<8>().0;
+    let inputs = reference_vectors.iter().zip(test_vectors);
+    let outputs = mean.iter_mut().zip(square).zip(cross);
+    for ((reference, test), ((mean, square), cross)) in inputs.zip(outputs) {
+        // Fixed-size chunks cover both loads and all three stores.
+        unsafe {
+            moment_row_vector(
+                reference.as_ptr(),
+                test.as_ptr(),
+                [mean.as_mut_ptr(), square.as_mut_ptr(), cross.as_mut_ptr()],
+            );
+        }
+    }
+    if done < n && done >= 8 {
+        let start = n - 8;
+        // An overlapping last vector covers the tail without reading past either input.
+        unsafe {
+            moment_row_vector(
+                reference.as_ptr().add(start),
+                test.as_ptr().add(start),
+                dst.each_mut().map(|p| p.as_mut_ptr().add(start)),
+            );
+        }
+        n
+    } else {
+        done
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn moment_row_vector(reference: *const f32, test: *const f32, dst: [*mut f32; 3]) {
+    // The caller provides one full vector behind every pointer.
+    unsafe {
+        let src = _mm256_loadu_ps(reference);
+        let rec = _mm256_loadu_ps(test);
+        _mm256_storeu_ps(dst[0], rec);
+        _mm256_storeu_ps(dst[1], _mm256_mul_ps(rec, rec));
+        _mm256_storeu_ps(dst[2], _mm256_mul_ps(src, rec));
+    }
+}
+
+/// # Safety
+/// AVX2 must be available, all outputs must have the same length,
+/// and each input must hold output.len() + 2 * RADIUS samples.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn blur_moment_horizontal_avx2(
+    src: [&[f32]; 3],
+    k: &[f32; WINDOW],
+    mut dst: [&mut [f32]; 3],
+) -> usize {
+    let n = dst[0].len();
+    // Length contracts cover complete vectors, including the overlapping tail.
+    unsafe {
+        let done = moment_horizontal::<2>(src, k, dst.each_mut().map(|p| &mut p[..]));
+        let done = if n - done >= 8 {
+            done + moment_horizontal::<1>(
+                src.map(|p| &p[done..]),
+                k,
+                dst.each_mut().map(|p| &mut p[done..]),
+            )
+        } else {
+            done
+        };
+        if done < n && done >= 8 {
+            let start = n - 8;
+            moment_horizontal::<1>(
+                src.map(|p| &p[start..]),
+                k,
+                dst.each_mut().map(|p| &mut p[start..]),
+            );
+            n
+        } else {
+            done
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn moment_horizontal<const N: usize>(
+    src: [&[f32]; 3],
+    k: &[f32; WINDOW],
+    dst: [&mut [f32]; 3],
+) -> usize {
+    let [mean, square, cross] = dst.map(|p| p.as_chunks_mut::<8>().0.as_chunks_mut::<N>().0);
+    let done = mean.len() * N * 8;
+    let center = _mm256_set1_ps(k[RADIUS]);
+    for (block, ((mean, square), cross)) in mean.iter_mut().zip(square).zip(cross).enumerate() {
+        let x = block * N * 8;
+        // Every input includes the halo, and every output contains this block.
+        unsafe {
+            let mut acc: [[__m256; N]; 3] = std::array::from_fn(|c| {
+                std::array::from_fn(|lane| {
+                    _mm256_mul_ps(
+                        _mm256_loadu_ps(src[c].as_ptr().add(x + lane * 8 + RADIUS)),
+                        center,
+                    )
+                })
+            });
+            for (i, &weight) in k[..RADIUS].iter().enumerate() {
+                let coeff = _mm256_set1_ps(weight);
+                for (c, plane) in acc.iter_mut().enumerate() {
+                    for (lane, sum) in plane.iter_mut().enumerate() {
+                        let offset = x + lane * 8;
+                        let a = _mm256_loadu_ps(src[c].as_ptr().add(offset + i));
+                        let b = _mm256_loadu_ps(src[c].as_ptr().add(offset + WINDOW - 1 - i));
+                        *sum = _mm256_add_ps(*sum, _mm256_mul_ps(_mm256_add_ps(a, b), coeff));
+                    }
+                }
+            }
+            for (dst, plane) in [mean, square, cross].into_iter().zip(acc) {
+                for (dst, value) in dst.iter_mut().zip(plane) {
+                    _mm256_storeu_ps(dst.as_mut_ptr(), value);
+                }
+            }
+        }
+    }
+    done
+}
+
+/// # Safety
+/// AVX2 must be available. Each row contains three planes of `width`
+/// samples; all outputs must have equal lengths no greater than width.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn blur_moment_vertical_avx2(
+    rows: &MomentRows<'_>,
+    width: usize,
+    k: &[f32; WINDOW],
+    mut dst: [&mut [f32]; 3],
+) -> usize {
+    let n = dst[0].len();
+    // Offsets keep the same eleven row pointers for every plane and tail.
+    unsafe {
+        let done = moment_vertical::<2>(rows, width, k, dst.each_mut().map(|p| &mut p[..]), 0, n);
+        let done = if n - done >= 8 {
+            moment_vertical::<1>(rows, width, k, dst.each_mut().map(|p| &mut p[..]), done, n)
+        } else {
+            done
+        };
+        if done < n && done >= 8 {
+            moment_vertical::<1>(rows, width, k, dst.each_mut().map(|p| &mut p[..]), n - 8, n);
+            n
+        } else {
+            done
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn moment_vertical<const N: usize>(
+    rows: &MomentRows<'_>,
+    width: usize,
+    k: &[f32; WINDOW],
+    dst: [&mut [f32]; 3],
+    start: usize,
+    end: usize,
+) -> usize {
+    let [mean, square, cross] = dst.map(|p| {
+        // The caller derives start..end from the shared output length.
+        let span = unsafe { p.get_unchecked_mut(start..end) };
+        span.as_chunks_mut::<8>().0.as_chunks_mut::<N>().0
+    });
+    let done = start + mean.len() * N * 8;
+    let center = _mm256_set1_ps(k[RADIUS]);
+    for (block, ((mean, square), cross)) in mean.iter_mut().zip(square).zip(cross).enumerate() {
+        let x = start + block * N * 8;
+        // Rows contain all three planes; every load/store lies in this block.
+        unsafe {
+            let mut acc: [[__m256; N]; 3] = std::array::from_fn(|c| {
+                std::array::from_fn(|lane| {
+                    _mm256_mul_ps(
+                        _mm256_loadu_ps(rows[RADIUS].as_ptr().add(c * width + x + lane * 8)),
+                        center,
+                    )
+                })
+            });
+            for (i, &weight) in k[..RADIUS].iter().enumerate() {
+                let coeff = _mm256_set1_ps(weight);
+                for (c, plane) in acc.iter_mut().enumerate() {
+                    for (lane, sum) in plane.iter_mut().enumerate() {
+                        let offset = c * width + x + lane * 8;
+                        let a = _mm256_loadu_ps(rows[i].as_ptr().add(offset));
+                        let b = _mm256_loadu_ps(rows[WINDOW - 1 - i].as_ptr().add(offset));
+                        *sum = _mm256_add_ps(*sum, _mm256_mul_ps(_mm256_add_ps(a, b), coeff));
+                    }
+                }
+            }
+            for (dst, plane) in [mean, square, cross].into_iter().zip(acc) {
+                for (dst, value) in dst.iter_mut().zip(plane) {
+                    _mm256_storeu_ps(dst.as_mut_ptr(), value);
+                }
+            }
+        }
     }
     done
 }

@@ -141,13 +141,10 @@ impl<'a> RgbImage<'a> {
             y * self.stride + rect.x0 * step..y * self.stride + rect.x1 * step
         };
         let non_finite = match self.pixels {
-            Pixels::SrgbF32(p) => rows
+            Pixels::SrgbF32(p) => rows.clone().any(|y| has_non_finite(&p[span(y, 3)])),
+            Pixels::Linear(p) => rows
                 .clone()
-                .any(|y| p[span(y, 3)].iter().any(|v| !v.is_finite())),
-            Pixels::Linear(p) => rows.clone().any(|y| {
-                p.iter()
-                    .any(|p| p[span(y, 1)].iter().any(|v| !v.is_finite()))
-            }),
+                .any(|y| p.iter().any(|p| has_non_finite(&p[span(y, 1)]))),
             _ => false,
         };
         if non_finite {
@@ -175,6 +172,29 @@ impl<'a> RgbImage<'a> {
         }
         Ok(())
     }
+}
+
+fn has_non_finite(pixels: &[f32]) -> bool {
+    type CheckFn = unsafe fn(&[f32]) -> bool;
+    static CHECK: OnceLock<CheckFn> = OnceLock::new();
+    let check = CHECK.get_or_init(|| {
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if std::is_x86_feature_detected!("avx2") {
+            return crate::avx::has_non_finite_avx2;
+        }
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+        if std::is_x86_feature_detected!("sse4.1") {
+            return crate::sse::has_non_finite_sse41;
+        }
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            crate::neon::has_non_finite_neon
+        }
+        #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+        |p| p.iter().any(|v| !v.is_finite())
+    });
+    // SAFETY: dispatch checked the CPU requirements; kernels respect the slice bounds.
+    unsafe { check(pixels) }
 }
 
 fn interleaved<T: Copy>(src: &[T], [r, g, b]: [&mut [f32]; 3], f: impl Fn(T) -> f32) {
@@ -239,6 +259,49 @@ fn validate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_finite_checks_cover_every_position_and_tail() {
+        #[allow(unused_mut)]
+        let mut checks: Vec<unsafe fn(&[f32]) -> bool> = vec![has_non_finite];
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            checks.push(crate::neon::has_non_finite_neon);
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if std::is_x86_feature_detected!("avx2") {
+            checks.push(crate::avx::has_non_finite_avx2);
+        }
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+        if std::is_x86_feature_detected!("sse4.1") {
+            checks.push(crate::sse::has_non_finite_sse41);
+        }
+        for check in checks {
+            for n in 0..=65 {
+                let mut data: Vec<_> = (0..n + 2)
+                    .map(|i| [0.0, -0.0, 1e-40, f32::MAX, f32::MIN][i % 5])
+                    .collect();
+                // SAFETY: features were detected; the offset slices exercise unaligned loads.
+                assert!(!unsafe { check(&data[1..n + 1]) });
+                for i in 1..=n {
+                    let saved = data[i];
+                    for invalid in [
+                        f32::NAN,
+                        f32::INFINITY,
+                        f32::NEG_INFINITY,
+                        f32::from_bits(0x7f80_0001),
+                    ] {
+                        data[i] = invalid;
+                        assert!(
+                            unsafe { check(&data[1..n + 1]) },
+                            "n={n}, i={i}, invalid={invalid}"
+                        );
+                    }
+                    data[i] = saved;
+                }
+            }
+        }
+    }
 
     #[test]
     fn transfer_endpoints_and_tables_agree() {

@@ -88,6 +88,7 @@ mod blur;
 mod downsample;
 mod image;
 mod incremental;
+mod maps;
 mod metric;
 #[cfg(all(feature = "neon", target_arch = "aarch64"))]
 mod neon;

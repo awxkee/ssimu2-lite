@@ -33,20 +33,35 @@ use std::{ops::Range, sync::OnceLock};
 pub(crate) const WINDOW: usize = 11;
 pub(crate) const RADIUS: usize = WINDOW / 2;
 pub(crate) type BlurRows<'a> = [&'a [f32]; WINDOW];
+/// Each row contains mean, square and cross-product planes consecutively.
+pub(crate) type MomentRows<'a> = [&'a [f32]; WINDOW];
 
 // SIMD kernels return the processed prefix; the driver handles scalar tails.
 type HorizontalFn = fn(&[f32], &[f32; WINDOW], &mut [f32]) -> usize;
+type MomentRowFn = fn([&[f32]; 2], [&mut [f32]; 3]) -> usize;
+type MomentHorizontalFn = fn([&[f32]; 3], &[f32; WINDOW], [&mut [f32]; 3]) -> usize;
+type MomentVerticalFn = fn(&MomentRows<'_>, usize, &[f32; WINDOW], [&mut [f32]; 3]) -> usize;
+type ProductFn = fn([&[f32]; 2], &mut [f32]) -> usize;
 type VerticalFn = fn(&BlurRows<'_>, &[f32; WINDOW], &mut [f32]) -> usize;
 
 #[derive(Clone, Copy)]
 struct Kernels {
     horizontal: HorizontalFn,
+    product: ProductFn,
     vertical: VerticalFn,
+    moment_row: MomentRowFn,
+    moment_horizontal: MomentHorizontalFn,
+    moment_vertical: MomentVerticalFn,
 }
 
+#[cfg(any(test, not(all(target_arch = "aarch64", feature = "neon"))))]
 const SCALAR: Kernels = Kernels {
     horizontal: horizontal_scalar,
+    product: product_scalar,
     vertical: vertical_scalar,
+    moment_row: moment_row_scalar,
+    moment_horizontal: moment_horizontal_scalar,
+    moment_vertical: moment_vertical_scalar,
 };
 
 fn selected_kernels() -> Kernels {
@@ -56,23 +71,48 @@ fn selected_kernels() -> Kernels {
         if std::arch::is_x86_feature_detected!("avx2") {
             return Kernels {
                 horizontal: |src, k, dst| unsafe { crate::avx::blur_horizontal_avx2(src, k, dst) },
+                product: |src, dst| unsafe { crate::avx::blur_product_row_avx2(src, dst) },
                 vertical: |rows, k, dst| unsafe { crate::avx::blur_vertical_avx2(rows, k, dst) },
+                moment_row: |s, d| unsafe { crate::avx::blur_moment_row_avx2(s, d) },
+                moment_horizontal: |s, k, d| unsafe {
+                    crate::avx::blur_moment_horizontal_avx2(s, k, d)
+                },
+                moment_vertical: |s, w, k, d| unsafe {
+                    crate::avx::blur_moment_vertical_avx2(s, w, k, d)
+                },
             };
         }
         #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
         if std::arch::is_x86_feature_detected!("sse4.1") {
             return Kernels {
                 horizontal: |src, k, dst| unsafe { crate::sse::blur_horizontal_sse41(src, k, dst) },
+                product: |src, dst| unsafe { crate::sse::blur_product_row_sse41(src, dst) },
                 vertical: |rows, k, dst| unsafe { crate::sse::blur_vertical_sse41(rows, k, dst) },
+                moment_row: |s, d| unsafe { crate::sse::blur_moment_row_sse41(s, d) },
+                moment_horizontal: |s, k, d| unsafe {
+                    crate::sse::blur_moment_horizontal_sse41(s, k, d)
+                },
+                moment_vertical: |s, w, k, d| unsafe {
+                    crate::sse::blur_moment_vertical_sse41(s, w, k, d)
+                },
             };
         }
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            return Kernels {
+        {
+            Kernels {
                 horizontal: |src, k, dst| unsafe { crate::neon::blur_horizontal_neon(src, k, dst) },
+                product: |src, dst| unsafe { crate::neon::blur_product_row_neon(src, dst) },
                 vertical: |rows, k, dst| unsafe { crate::neon::blur_vertical_neon(rows, k, dst) },
-            };
+                moment_row: |s, d| unsafe { crate::neon::blur_moment_row_neon(s, d) },
+                moment_horizontal: |s, k, d| unsafe {
+                    crate::neon::blur_moment_horizontal_neon(s, k, d)
+                },
+                moment_vertical: |s, w, k, d| unsafe {
+                    crate::neon::blur_moment_vertical_neon(s, w, k, d)
+                },
+            }
         }
+        #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
         SCALAR
     })
 }
@@ -102,6 +142,9 @@ pub(crate) struct GaussianBlur {
     width: usize,
     ring: Vec<f32>,
     padded: Vec<f32>,
+    /// Three moment planes per ring row, allocated only when SSIM needs them.
+    moment_ring: Vec<f32>,
+    moment_padded: [Vec<f32>; 2],
     /// All-zero row for zero padding in the vertical pass.
     zero_row: Vec<f32>,
     kernels: Kernels,
@@ -123,7 +166,9 @@ impl GaussianBlur {
             width,
             ring: vec![0.0; width * WINDOW],
             padded: vec![0.0; width + 2 * RADIUS],
-            zero_row: vec![0.0; width],
+            moment_ring: Default::default(),
+            moment_padded: Default::default(),
+            zero_row: vec![0.0; 3 * width],
             kernels: selected_kernels(),
             kernel,
             zero_pad,
@@ -135,7 +180,9 @@ impl GaussianBlur {
         self.width = width;
         self.ring.resize(width * WINDOW, 0.0);
         self.padded.resize(width + 2 * RADIUS, 0.0);
-        self.zero_row.resize(width, 0.0);
+        if self.zero_row.len() < 3 * width {
+            self.zero_row.resize(3 * width, 0.0);
+        }
     }
 
     /// Separable blur; borders replicate the edge or read zeros (`zero_pad`).
@@ -190,6 +237,142 @@ impl GaussianBlur {
         self.blur_region_impl::<true>(src, src_width, height, region, out, out_stride);
     }
 
+    /// Blur the test mean, test square and reference/test cross-product together.
+    /// Inputs are `[reference, test]`; outputs are `[mu2, s22, s12]`.
+    pub(crate) fn blur_moments(&mut self, src: [&[f32]; 2], height: usize, out: [&mut [f32]; 3]) {
+        let w = self.width;
+        assert!(out.iter().all(|p| p.len() == w * height));
+        self.blur_moments_region(src, w, height, [0..w, 0..height], out, w);
+    }
+
+    /// Region version of `blur_moments`, with the same halo and output layout
+    /// as `blur_region`. Products round to f32 before horizontal filtering.
+    pub(crate) fn blur_moments_region(
+        &mut self,
+        [reference, test]: [&[f32]; 2],
+        src_width: usize,
+        height: usize,
+        [columns, rows]: [Range<usize>; 2],
+        mut out: [&mut [f32]; 3],
+        out_stride: usize,
+    ) {
+        let w = self.width;
+        assert_eq!(test.len(), src_width * height);
+        assert_eq!(reference.len(), test.len());
+        assert!(columns.start <= columns.end && columns.end <= src_width);
+        assert!(rows.start <= rows.end && rows.end <= height);
+        assert_eq!(columns.len(), w);
+        assert!(out_stride >= w);
+        if w == 0 || rows.is_empty() {
+            return;
+        }
+        assert!(
+            out.iter()
+                .all(|p| p.len() >= (rows.len() - 1) * out_stride + w)
+        );
+        // Retain initialized scratch across narrower scales/regions. Every live
+        // ring row is overwritten before use, so shrinking and zeroing it again
+        // on the next wider update would only add memory traffic.
+        if self.moment_ring.len() < 3 * w * WINDOW {
+            self.moment_ring.resize(3 * w * WINDOW, 0.0);
+        }
+        for padded in &mut self.moment_padded {
+            if padded.len() < w + 2 * RADIUS {
+                padded.resize(w + 2 * RADIUS, 0.0);
+            }
+        }
+        let [square_padded, cross_padded] = &mut self.moment_padded;
+        let mut padded = [
+            &mut self.padded[..],
+            &mut square_padded[..w + 2 * RADIUS],
+            &mut cross_padded[..w + 2 * RADIUS],
+        ];
+        let k = &self.kernel;
+        let first = columns.start.saturating_sub(RADIUS);
+        let last = (columns.end + RADIUS).min(src_width);
+        let left_pad = RADIUS.saturating_sub(columns.start);
+        let copied_end = left_pad + last - first;
+        let mut next_row = rows.start.saturating_sub(RADIUS);
+        for y in rows.clone() {
+            let last_row = (y + RADIUS).min(height - 1);
+            while next_row <= last_row {
+                let start = next_row * src_width;
+                let rec = &test[start..start + src_width];
+                let src = &reference[start..start + src_width];
+                let edge = |x: usize| {
+                    if self.zero_pad {
+                        [0.0; 3]
+                    } else {
+                        [rec[x], rec[x] * rec[x], src[x] * rec[x]]
+                    }
+                };
+                let left = edge(0);
+                let right = edge(src_width - 1);
+                for c in 0..3 {
+                    padded[c][..left_pad].fill(left[c]);
+                    padded[c][copied_end..].fill(right[c]);
+                }
+                let inputs = [&src[first..last], &rec[first..last]];
+                let done = (self.kernels.moment_row)(
+                    inputs,
+                    padded.each_mut().map(|p| &mut p[left_pad..copied_end]),
+                );
+                if done < last - first {
+                    moment_row_scalar(
+                        inputs.map(|p| &p[done..]),
+                        padded
+                            .each_mut()
+                            .map(|p| &mut p[left_pad + done..copied_end]),
+                    );
+                }
+                let slot = next_row % WINDOW;
+                let start = slot * 3 * w;
+                let (mean, products) = self.moment_ring[start..start + 3 * w].split_at_mut(w);
+                let (square, cross) = products.split_at_mut(w);
+                let mut dst = [mean, square, cross];
+                let done = (self.kernels.moment_horizontal)(
+                    padded.each_ref().map(|p| &p[..]),
+                    k,
+                    dst.each_mut().map(|p| &mut p[..]),
+                );
+                if done < w {
+                    moment_horizontal_scalar(
+                        padded.each_ref().map(|p| &p[done..]),
+                        k,
+                        dst.each_mut().map(|p| &mut p[done..]),
+                    );
+                }
+                next_row += 1;
+            }
+            // Compute each source-row/slot index once for all three moments.
+            let window: MomentRows<'_> = std::array::from_fn(|i| {
+                let sy = (y + i) as isize - RADIUS as isize;
+                if self.zero_pad && (sy < 0 || sy >= height as isize) {
+                    return &self.zero_row[..3 * w];
+                }
+                let sy = sy.max(0).min(height as isize - 1) as usize;
+                let start = sy % WINDOW * 3 * w;
+                &self.moment_ring[start..start + 3 * w]
+            });
+            let start = (y - rows.start) * out_stride;
+            let done = (self.kernels.moment_vertical)(
+                &window,
+                w,
+                k,
+                out.each_mut().map(|p| &mut p[start..start + w]),
+            );
+            if done < w {
+                moment_vertical_tail(
+                    &window,
+                    w,
+                    k,
+                    out.each_mut().map(|p| &mut p[start..start + w]),
+                    done,
+                );
+            }
+        }
+    }
+
     fn blur_region_impl<const PRODUCT: bool>(
         &mut self,
         [src, second]: [&[f32]; 2],
@@ -234,13 +417,9 @@ impl GaussianBlur {
                 let dst = &mut self.padded[left_pad..copied_end];
                 if PRODUCT {
                     let other = &second[next_row * src_width..(next_row + 1) * src_width];
-                    for ((out, &a), &b) in dst
-                        .iter_mut()
-                        .zip(&row[first..last])
-                        .zip(&other[first..last])
-                    {
-                        *out = a * b;
-                    }
+                    let inputs = [&row[first..last], &other[first..last]];
+                    let done = (self.kernels.product)(inputs, dst);
+                    product_scalar(inputs.map(|p| &p[done..]), &mut dst[done..]);
                 } else {
                     dst.copy_from_slice(&row[first..last]);
                 }
@@ -257,7 +436,7 @@ impl GaussianBlur {
             let window_rows: BlurRows<'_> = std::array::from_fn(|i| {
                 let sy = (y + i) as isize - RADIUS as isize;
                 if self.zero_pad && (sy < 0 || sy >= height as isize) {
-                    return &self.zero_row[..];
+                    return &self.zero_row[..w];
                 }
                 let sy = sy.max(0).min(height as isize - 1) as usize;
                 let slot = sy % WINDOW;
@@ -274,9 +453,84 @@ impl GaussianBlur {
     }
 
     #[cfg(test)]
-    pub(crate) fn scratch_layout(&self) -> [(usize, usize); 3] {
-        [&self.ring, &self.padded, &self.zero_row]
-            .map(|buffer| (buffer.as_ptr() as usize, buffer.capacity()))
+    pub(crate) fn scratch_layout(&self) -> [(usize, usize); 6] {
+        [
+            &self.ring,
+            &self.padded,
+            &self.zero_row,
+            &self.moment_ring,
+            &self.moment_padded[0],
+            &self.moment_padded[1],
+        ]
+        .map(|buffer| (buffer.as_ptr() as usize, buffer.capacity()))
+    }
+}
+
+fn product_scalar([a, b]: [&[f32]; 2], dst: &mut [f32]) -> usize {
+    for ((out, &a), &b) in dst.iter_mut().zip(a).zip(b) {
+        *out = a * b;
+    }
+    dst.len()
+}
+
+fn moment_row_scalar(
+    [reference, test]: [&[f32]; 2],
+    [mean, square, cross]: [&mut [f32]; 3],
+) -> usize {
+    for i in 0..mean.len() {
+        let rec = test[i];
+        mean[i] = rec;
+        square[i] = rec * rec;
+        cross[i] = reference[i] * rec;
+    }
+    mean.len()
+}
+
+fn moment_horizontal_scalar(src: [&[f32]; 3], k: &[f32; WINDOW], dst: [&mut [f32]; 3]) -> usize {
+    for x in 0..dst[0].len() {
+        let mut acc = src.map(|p| p[x + RADIUS] * k[RADIUS]);
+        for i in 0..RADIUS {
+            for c in 0..3 {
+                acc[c] += (src[c][x + i] + src[c][x + WINDOW - 1 - i]) * k[i];
+            }
+        }
+        for c in 0..3 {
+            dst[c][x] = acc[c];
+        }
+    }
+    dst[0].len()
+}
+
+#[cfg(any(test, not(all(target_arch = "aarch64", feature = "neon"))))]
+fn moment_vertical_scalar(
+    rows: &MomentRows<'_>,
+    width: usize,
+    k: &[f32; WINDOW],
+    dst: [&mut [f32]; 3],
+) -> usize {
+    let n = dst[0].len();
+    moment_vertical_tail(rows, width, k, dst, 0);
+    n
+}
+
+fn moment_vertical_tail(
+    rows: &MomentRows<'_>,
+    width: usize,
+    k: &[f32; WINDOW],
+    dst: [&mut [f32]; 3],
+    start: usize,
+) {
+    for x in start..dst[0].len() {
+        let mut acc: [f32; 3] = std::array::from_fn(|c| rows[RADIUS][c * width + x] * k[RADIUS]);
+        for i in 0..RADIUS {
+            for c in 0..3 {
+                let at = c * width + x;
+                acc[c] += (rows[i][at] + rows[WINDOW - 1 - i][at]) * k[i];
+            }
+        }
+        for c in 0..3 {
+            dst[c][x] = acc[c];
+        }
     }
 }
 
@@ -312,12 +566,20 @@ mod tests {
         #[allow(unused_mut)]
         let mut kernels = vec![("dispatch", selected_kernels()), ("scalar", SCALAR)];
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        if std::arch::is_aarch64_feature_detected!("neon") {
+        {
             kernels.push((
                 "neon",
                 Kernels {
                     horizontal: |s, k, d| unsafe { crate::neon::blur_horizontal_neon(s, k, d) },
+                    product: |s, d| unsafe { crate::neon::blur_product_row_neon(s, d) },
                     vertical: |s, k, d| unsafe { crate::neon::blur_vertical_neon(s, k, d) },
+                    moment_row: |s, d| unsafe { crate::neon::blur_moment_row_neon(s, d) },
+                    moment_horizontal: |s, k, d| unsafe {
+                        crate::neon::blur_moment_horizontal_neon(s, k, d)
+                    },
+                    moment_vertical: |s, w, k, d| unsafe {
+                        crate::neon::blur_moment_vertical_neon(s, w, k, d)
+                    },
                 },
             ));
         }
@@ -327,7 +589,15 @@ mod tests {
                 "avx2",
                 Kernels {
                     horizontal: |s, k, d| unsafe { crate::avx::blur_horizontal_avx2(s, k, d) },
+                    product: |s, d| unsafe { crate::avx::blur_product_row_avx2(s, d) },
                     vertical: |s, k, d| unsafe { crate::avx::blur_vertical_avx2(s, k, d) },
+                    moment_row: |s, d| unsafe { crate::avx::blur_moment_row_avx2(s, d) },
+                    moment_horizontal: |s, k, d| unsafe {
+                        crate::avx::blur_moment_horizontal_avx2(s, k, d)
+                    },
+                    moment_vertical: |s, w, k, d| unsafe {
+                        crate::avx::blur_moment_vertical_avx2(s, w, k, d)
+                    },
                 },
             ));
         }
@@ -337,7 +607,15 @@ mod tests {
                 "sse4.1",
                 Kernels {
                     horizontal: |s, k, d| unsafe { crate::sse::blur_horizontal_sse41(s, k, d) },
+                    product: |s, d| unsafe { crate::sse::blur_product_row_sse41(s, d) },
                     vertical: |s, k, d| unsafe { crate::sse::blur_vertical_sse41(s, k, d) },
+                    moment_row: |s, d| unsafe { crate::sse::blur_moment_row_sse41(s, d) },
+                    moment_horizontal: |s, k, d| unsafe {
+                        crate::sse::blur_moment_horizontal_sse41(s, k, d)
+                    },
+                    moment_vertical: |s, w, k, d| unsafe {
+                        crate::sse::blur_moment_vertical_sse41(s, w, k, d)
+                    },
                 },
             ));
         }
@@ -571,10 +849,114 @@ mod tests {
     }
 
     #[test]
+    fn fused_moments_match_three_passes_bit_exactly_and_reuse_scratch() {
+        const GUARD: f32 = -12345.0;
+        let values = [-0.0, 1e-23, -1e-20, -0.7, 0.125, 1.0, 1e15];
+        for zero_pad in [false, true] {
+            for (name, kernels) in available_kernels() {
+                for w in (1..=40).chain([47, 63, 64, 65, 127, 128, 129]) {
+                    for h in [1, 3, 17, 37] {
+                        let a: Vec<_> =
+                            (0..w * h).map(|i| values[(i * 3) % values.len()]).collect();
+                        let b: Vec<_> = (0..w * h)
+                            .map(|i| values[(i * 5 + 1) % values.len()])
+                            .collect();
+                        for [src, rec] in [[&a[..], &a[..]], [&a[..], &b[..]]] {
+                            let mut separate = GaussianBlur::with_kernel(w, *kernel(), zero_pad);
+                            separate.kernels = kernels;
+                            let mut expected: [Vec<f32>; 3] =
+                                std::array::from_fn(|_| vec![f32::NAN; w * h]);
+                            separate.blur(rec, h, &mut expected[0]);
+                            separate.blur_product([rec, rec], h, &mut expected[1]);
+                            separate.blur_product([src, rec], h, &mut expected[2]);
+                            let mut fused = GaussianBlur::with_kernel(w, *kernel(), zero_pad);
+                            fused.kernels = kernels;
+                            // Extra buffers are lazy; mean/product blurs need no fused scratch.
+                            assert!(
+                                fused.moment_ring.capacity() == 0
+                                    && fused.moment_padded.iter().all(|p| p.capacity() == 0)
+                            );
+                            let mut actual: [Vec<f32>; 3] =
+                                std::array::from_fn(|_| vec![GUARD; w * h + 2]);
+                            fused.blur_moments(
+                                [src, rec],
+                                h,
+                                actual.each_mut().map(|p| &mut p[1..w * h + 1]),
+                            );
+                            for c in 0..3 {
+                                for i in 0..w * h {
+                                    assert_eq!(
+                                        actual[c][i + 1].to_bits(),
+                                        expected[c][i].to_bits(),
+                                        "{name}, zero_pad={zero_pad}, {w}x{h}, c={c}, i={i}"
+                                    );
+                                }
+                                assert_eq!(actual[c][0], GUARD);
+                                assert_eq!(actual[c][w * h + 1], GUARD);
+                            }
+                            let scratch = fused.scratch_layout();
+                            for [columns, rows] in [
+                                [0..w, 0..h],
+                                [0..1, 0..1],
+                                [w - 1..w, h - 1..h],
+                                [w / 3..w.div_ceil(2), h / 3..h.div_ceil(2)],
+                                [0..w.div_ceil(2), h / 2..h],
+                                [w / 2..w, 0..h.div_ceil(2)],
+                                [0..0, 0..h],
+                                [0..w, 0..0],
+                            ] {
+                                fused.set_width(columns.len());
+                                for plane in &mut actual {
+                                    plane.fill(GUARD);
+                                }
+                                let offset = 1 + rows.start * w + columns.start;
+                                fused.blur_moments_region(
+                                    [src, rec],
+                                    w,
+                                    h,
+                                    [columns.clone(), rows.clone()],
+                                    actual.each_mut().map(|p| &mut p[offset..]),
+                                    w,
+                                );
+                                for c in 0..3 {
+                                    for y in 0..h {
+                                        for x in 0..w {
+                                            let wanted =
+                                                if columns.contains(&x) && rows.contains(&y) {
+                                                    expected[c][y * w + x]
+                                                } else {
+                                                    GUARD
+                                                };
+                                            assert_eq!(
+                                                actual[c][1 + y * w + x].to_bits(),
+                                                wanted.to_bits(),
+                                                "{name}, zero_pad={zero_pad}, {w}x{h}, {columns:?}x{rows:?}, c={c}, ({x},{y})"
+                                            );
+                                        }
+                                    }
+                                    assert_eq!(actual[c][0], GUARD);
+                                    assert_eq!(actual[c][w * h + 1], GUARD);
+                                }
+                                assert_eq!(
+                                    fused.scratch_layout(),
+                                    scratch,
+                                    "{name}, {w}x{h}, {columns:?}x{rows:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn empty_images_are_supported() {
         GaussianBlur::new(0).blur(&[], 4, &mut []);
         GaussianBlur::new(7).blur(&[], 0, &mut []);
         GaussianBlur::new(0).blur_product([&[], &[]], 4, &mut []);
         GaussianBlur::new(7).blur_product([&[], &[]], 0, &mut []);
+        GaussianBlur::new(0).blur_moments([&[], &[]], 4, [&mut [], &mut [], &mut []]);
+        GaussianBlur::new(7).blur_moments([&[], &[]], 0, [&mut [], &mut [], &mut []]);
     }
 }

@@ -64,22 +64,27 @@ fn mix(row: usize, r: float32x4_t, g: float32x4_t, b: float32x4_t) -> float32x4_
     vaddq_f32(v, vdupq_n_f32(NEG_BIAS_CBRT))
 }
 
-/// One vector of plain XYB from `lanes` pixels at the given pointers.
+/// One vector of positive XYB from `lanes` pixels at the given pointers.
 ///
 /// # Safety
 /// Each pointer must be valid for 4 reads/writes.
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn convert(input: [*const f32; 3], output: [*mut f32; 3]) {
+fn convert(input: [*const f32; 3], output: [*mut f32; 3]) {
     // The caller guarantees complete vectors behind every pointer.
     unsafe {
         let [r, g, b] = input.map(|p| vld1q_f32(p));
         let l = mix(0, r, g, b);
         let m = mix(1, r, g, b);
         let s = mix(2, r, g, b);
-        vst1q_f32(output[0], vmulq_n_f32(vsubq_f32(l, m), 0.5));
-        vst1q_f32(output[1], vmulq_n_f32(vaddq_f32(l, m), 0.5));
-        vst1q_f32(output[2], s);
+        let x = vmulq_n_f32(vsubq_f32(l, m), 0.5);
+        let y = vmulq_n_f32(vaddq_f32(l, m), 0.5);
+        vst1q_f32(
+            output[0],
+            vaddq_f32(vmulq_n_f32(x, 14.0), vdupq_n_f32(0.42)),
+        );
+        vst1q_f32(output[1], vaddq_f32(y, vdupq_n_f32(0.01)));
+        vst1q_f32(output[2], vaddq_f32(vsubq_f32(s, y), vdupq_n_f32(0.55)));
     }
 }
 
@@ -89,22 +94,22 @@ unsafe fn convert(input: [*const f32; 3], output: [*mut f32; 3]) {
 /// # Safety
 /// The CPU features must be available and all six slices must have equal lengths.
 #[target_feature(enable = "neon")]
-pub(crate) unsafe fn xyb_rows_neon(input: [&[f32]; 3], [x, y, out_b]: [&mut [f32]; 3]) -> usize {
+pub(crate) fn xyb_rows_neon(input: [&[f32]; 3], [x, y, out_b]: [&mut [f32]; 3]) -> usize {
     let n = x.len();
-    let done = n / 4 * 4;
-    for i in (0..done).step_by(4) {
-        // Every slice holds `n` elements, so each complete vector is in bounds.
-        unsafe {
-            convert(
-                input.map(|p| p.as_ptr().add(i)),
-                [
-                    x.as_mut_ptr().add(i),
-                    y.as_mut_ptr().add(i),
-                    out_b.as_mut_ptr().add(i),
-                ],
-            );
-        }
+    let (x_vectors, x_tail) = x.as_chunks_mut::<4>();
+    let (y_vectors, y_tail) = y.as_chunks_mut::<4>();
+    let (b_vectors, b_tail) = out_b.as_chunks_mut::<4>();
+    let [r, g, b] = input.map(|p| p.as_chunks::<4>().0);
+    let inputs = r.iter().zip(g).zip(b);
+    let outputs = x_vectors.iter_mut().zip(y_vectors).zip(b_vectors);
+    for (((r, g), b), ((x, y), out_b)) in inputs.zip(outputs) {
+        // Fixed-size chunks hold a complete vector in every plane.
+        convert(
+            [r.as_ptr(), g.as_ptr(), b.as_ptr()],
+            [x.as_mut_ptr(), y.as_mut_ptr(), out_b.as_mut_ptr()],
+        );
     }
+    let done = n - x_tail.len();
     if done < n {
         let tail = n - done;
         let src: [[f32; 4]; 3] = std::array::from_fn(|c| {
@@ -115,15 +120,13 @@ pub(crate) unsafe fn xyb_rows_neon(input: [&[f32]; 3], [x, y, out_b]: [&mut [f32
         let mut dst = [[0f32; 4]; 3];
         let [dx, dy, db] = &mut dst;
         // Stack buffers hold one complete vector each.
-        unsafe {
-            convert(
-                src.each_ref().map(|v| v.as_ptr()),
-                [dx.as_mut_ptr(), dy.as_mut_ptr(), db.as_mut_ptr()],
-            );
-        }
-        x[done..].copy_from_slice(&dst[0][..tail]);
-        y[done..].copy_from_slice(&dst[1][..tail]);
-        out_b[done..].copy_from_slice(&dst[2][..tail]);
+        convert(
+            src.each_ref().map(|v| v.as_ptr()),
+            [dx.as_mut_ptr(), dy.as_mut_ptr(), db.as_mut_ptr()],
+        );
+        x_tail.copy_from_slice(&dst[0][..tail]);
+        y_tail.copy_from_slice(&dst[1][..tail]);
+        b_tail.copy_from_slice(&dst[2][..tail]);
     }
     n
 }

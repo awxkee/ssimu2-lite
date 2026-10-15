@@ -36,7 +36,14 @@ pub(crate) fn downsample_rows_sse41(top: &[f32], bottom: &[f32], dst: &mut [f32]
     assert!(top.len() / 2 >= dst.len());
     assert!(bottom.len() / 2 >= dst.len());
     let done = downsample::<4>(top, bottom, dst);
-    done + downsample::<1>(&top[2 * done..], &bottom[2 * done..], &mut dst[done..])
+    let done = done + downsample::<1>(&top[2 * done..], &bottom[2 * done..], &mut dst[done..]);
+    if done < dst.len() && done >= 4 {
+        let start = dst.len() - 4;
+        downsample::<1>(&top[2 * start..], &bottom[2 * start..], &mut dst[start..]);
+        dst.len()
+    } else {
+        done
+    }
 }
 
 #[inline]
@@ -44,13 +51,12 @@ pub(crate) fn downsample_rows_sse41(top: &[f32], bottom: &[f32], dst: &mut [f32]
 fn downsample<const N: usize>(top: &[f32], bottom: &[f32], dst: &mut [f32]) -> usize {
     const LANES: usize = 4;
     let quarter = _mm_set1_ps(0.25);
-    let mut done = 0;
     let (vectors, _) = dst.as_chunks_mut::<LANES>();
     let (blocks, _) = vectors.as_chunks_mut::<N>();
+    let done = blocks.len() * N * LANES;
     for (block, dst) in blocks.iter_mut().enumerate() {
-        let dst = dst.as_flattened_mut();
         let x = block * N * LANES;
-        for lane in 0..N {
+        for (lane, dst) in dst.iter_mut().enumerate() {
             // Each output vector consumes two input vectors from each row.
             // Entry-point checks cover every load; stores fit this chunk.
             // Sum the top pair, then each bottom value to keep scalar rounding.
@@ -64,10 +70,9 @@ fn downsample<const N: usize>(top: &[f32], bottom: &[f32], dst: &mut [f32]) -> u
                 let c = _mm_shuffle_ps::<0x88>(b0, b1);
                 let d = _mm_shuffle_ps::<0xdd>(b0, b1);
                 let sum = _mm_add_ps(_mm_add_ps(top_pairs, c), d);
-                _mm_storeu_ps(dst.as_mut_ptr().add(lane * LANES), _mm_mul_ps(sum, quarter));
+                _mm_storeu_ps(dst.as_mut_ptr(), _mm_mul_ps(sum, quarter));
             }
         }
-        done += N * LANES;
     }
     done
 }

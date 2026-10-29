@@ -45,7 +45,7 @@ type ProductFn = fn([&[f32]; 2], &mut [f32]) -> usize;
 type VerticalFn = fn(&BlurRows<'_>, &[f32; WINDOW], &mut [f32]) -> usize;
 
 #[derive(Clone, Copy)]
-struct Kernels {
+pub(crate) struct Kernels {
     horizontal: HorizontalFn,
     product: ProductFn,
     vertical: VerticalFn,
@@ -64,7 +64,7 @@ const SCALAR: Kernels = Kernels {
     moment_vertical: moment_vertical_scalar,
 };
 
-fn selected_kernels() -> Kernels {
+pub(crate) fn selected_kernels() -> Kernels {
     static KERNELS: OnceLock<Kernels> = OnceLock::new();
     *KERNELS.get_or_init(|| {
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
@@ -161,7 +161,17 @@ impl GaussianBlur {
 
     /// Any symmetric `WINDOW`-tap kernel; `zero_pad` treats pixels outside the
     /// plane as zero instead of replicating the edge.
+    #[cfg(test)]
     pub(crate) fn with_kernel(width: usize, kernel: [f32; WINDOW], zero_pad: bool) -> Self {
+        Self::with_kernels(width, kernel, zero_pad, selected_kernels())
+    }
+
+    pub(crate) fn with_kernels(
+        width: usize,
+        kernel: [f32; WINDOW],
+        zero_pad: bool,
+        kernels: Kernels,
+    ) -> Self {
         Self {
             width,
             ring: vec![0.0; width * WINDOW],
@@ -169,7 +179,7 @@ impl GaussianBlur {
             moment_ring: Default::default(),
             moment_padded: Default::default(),
             zero_row: vec![0.0; 3 * width],
-            kernels: selected_kernels(),
+            kernels,
             kernel,
             zero_pad,
         }

@@ -35,13 +35,12 @@
 //! then costs a few hundred flops.
 
 use crate::blur::GaussianBlur;
-use crate::downsample::downsample_rows;
-use crate::maps::{MapKind, replace_edge_maps, replace_map};
+use crate::dispatch::Kernels;
+use crate::maps::MapKind;
 use crate::metric::{
-    PooledContribution, PreparedReference, RADIUS, ReferenceData, WEIGHTS, accumulate_scale_map,
-    active_maps, deficit_slope, kernel, score_from_sum, weight_base,
+    PooledContribution, PreparedReference, RADIUS, ReferenceData, WEIGHTS, active_maps,
+    deficit_slope, kernel, score_from_sum, weight_base,
 };
-use crate::xyb::positive_xyb_into;
 use crate::{Error, RgbImage};
 use std::sync::Arc;
 
@@ -122,6 +121,8 @@ fn load_rows(buf: &mut [f32], w: usize, r: Rect, data: &[f32], mut at: usize) ->
 /// [`PreparedReference::compare`] up to float summation order.
 pub struct IncrementalState {
     reference: Arc<ReferenceData>,
+    /// Dispatch inherited from the prepared reference, reused by every update.
+    kernels: Kernels,
     /// Test image's linear RGB planes per scale: `[scale][channel]`.
     lin: Vec<[Vec<f32>; 3]>,
     /// Test image's positive XYB planes per scale.
@@ -144,10 +145,12 @@ impl IncrementalState {
         if (test.width(), test.height()) != (data.width, data.height) {
             return Err(Error::DimensionMismatch);
         }
-        let mut lin = test.to_linear()?;
+        let kernels = data.kernels;
+        let mut lin = test.to_linear(kernels.image)?;
         let scales = data.scales.len();
         let mut st = IncrementalState {
-            blur: GaussianBlur::with_kernel(data.width, *kernel(), true),
+            blur: GaussianBlur::with_kernels(data.width, *kernel(), true, kernels.blur),
+            kernels,
             reference: data,
             lin: Vec::with_capacity(scales),
             xyb: Vec::with_capacity(scales),
@@ -161,13 +164,15 @@ impl IncrementalState {
                 let (pw, ph) = st.dims(s - 1);
                 let previous = &st.lin[s - 1];
                 lin =
-                    std::array::from_fn(|c| crate::downsample::downsample(&previous[c], pw, ph).0);
+                    std::array::from_fn(|c| kernels.downsample.downsample(&previous[c], pw, ph).0);
             }
             let n = w * h;
             let mut xyb = [vec![0f32; n], vec![0f32; n], vec![0f32; n]];
             {
                 let [x, y, b] = &mut xyb;
-                positive_xyb_into([&lin[0], &lin[1], &lin[2]], [x, y, b]);
+                kernels
+                    .xyb
+                    .positive_xyb_into([&lin[0], &lin[1], &lin[2]], [x, y, b]);
             }
             st.lin.push(std::mem::take(&mut lin));
             st.xyb.push(xyb);
@@ -266,7 +271,7 @@ impl IncrementalState {
             let start = (y - r.y0) * (r.x1 - r.x0);
             let scratch = start..start + r.x1 - r.x0;
             if active[0] {
-                replace_map(
+                self.kernels.maps.replace_map(
                     MapKind::Ssim,
                     [
                         &mu1[span.clone()],
@@ -289,14 +294,14 @@ impl IncrementalState {
             ];
             if active[1] && active[2] {
                 let [_, artifact_sum, detail_sum] = &mut self.sums[s][c];
-                replace_edge_maps(
+                self.kernels.maps.replace_edge_maps(
                     inputs,
                     [&mut artifact[span.clone()], &mut detail[span]],
                     [artifact_sum, detail_sum],
                     [need_fourth[1], need_fourth[2]],
                 );
             } else if active[1] {
-                replace_map(
+                self.kernels.maps.replace_map(
                     MapKind::Artifact,
                     inputs,
                     &mut artifact[span],
@@ -304,7 +309,7 @@ impl IncrementalState {
                     need_fourth[1],
                 );
             } else if active[2] {
-                replace_map(
+                self.kernels.maps.replace_map(
                     MapKind::Detail,
                     inputs,
                     &mut detail[span],
@@ -361,7 +366,7 @@ impl IncrementalState {
         }
         {
             let [r, g, b] = &mut self.lin[0];
-            test.linear_into(r0, [r, g, b], w0)?;
+            test.linear_into(r0, [r, g, b], w0, self.kernels.image)?;
         }
         let mut rs = r0;
         for s in 0..self.lin.len() {
@@ -377,7 +382,7 @@ impl IncrementalState {
                     let (x0, x1) = (2 * rs.x0, (2 * rs.x1).min(pw));
                     for c in 0..3 {
                         let p = &previous[s - 1][c];
-                        downsample_rows(
+                        self.kernels.downsample.downsample_rows(
                             &p[y0 * pw + x0..y0 * pw + x1],
                             &p[y1 * pw + x0..y1 * pw + x1],
                             &mut current[c][y * w + rs.x0..y * w + rs.x1],
@@ -389,7 +394,7 @@ impl IncrementalState {
             let [x, y, b] = &mut self.xyb[s];
             for row in rs.y0..rs.y1 {
                 let span = row * w + rs.x0..row * w + rs.x1;
-                positive_xyb_into(
+                self.kernels.xyb.positive_xyb_into(
                     [
                         &lin[0][span.clone()],
                         &lin[1][span.clone()],
@@ -531,11 +536,13 @@ impl IncrementalState {
                 for (maps, coefficients) in self.maps[s].iter().zip(coefficients) {
                     for (values, coefficient) in maps.iter().zip(coefficients) {
                         if let Some(coefficient) = coefficient {
-                            coefficient.add(&values[start..end], acc);
+                            coefficient.add(self.kernels.error_map, &values[start..end], acc);
                         }
                     }
                 }
-                accumulate_scale_map(acc, w0, rows.len() / w0, s, rows);
+                self.kernels
+                    .error_map
+                    .accumulate_scale_map(acc, w0, rows.len() / w0, s, rows);
             }
         }
         let factor = deficit_slope(sum) as f32 * (w0 * h0) as f32;
@@ -550,7 +557,6 @@ impl IncrementalState {
 mod state_tests {
     use super::*;
     use crate::Error;
-    use crate::maps::map_sums;
     use crate::metric::{MapContribution, contribution_scalar};
     use crate::testing::{Planes, full, state_of};
 
@@ -581,7 +587,7 @@ mod state_tests {
                     let base = weight_base(c, s, state.scales());
                     for m in 0..3 {
                         let (s1, s4) = state.sums[s][c][m];
-                        let expected = map_sums(&state.maps[s][c][m]);
+                        let expected = state.kernels.maps.map_sums(&state.maps[s][c][m]);
                         // The first sum also detects exact-zero maps when only
                         // their fourth norm is weighted.
                         assert!((s1 - expected.0).abs() <= 2e-12 * expected.0.abs().max(1.0));

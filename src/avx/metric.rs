@@ -80,12 +80,35 @@ fn contribution<const N: usize, const FOURTH: bool>(
             }
         }
     }
-    done
+    // The final pass also consumes short tails with explicit scalar FMA.
+    // Keeping this inside the feature-gated kernel avoids software fmaf calls.
+    if N == 1 {
+        let linear = _mm_set_ss(p.linear);
+        let inv_norm = _mm_set_ss(p.inv_norm);
+        let norm_weight = _mm_set_ss(p.norm_weight);
+        for (&v, acc) in map[done..].iter().zip(&mut acc[done..]) {
+            let v = _mm_set_ss(v);
+            let old = _mm_set_ss(*acc);
+            let out = if FOURTH {
+                let normalized = _mm_mul_ss(v, inv_norm);
+                let square = _mm_mul_ss(normalized, normalized);
+                let weighted = _mm_mul_ss(square, norm_weight);
+                let first = _mm_mul_ss(v, linear);
+                _mm_add_ss(old, _mm_fmadd_ss(weighted, square, first))
+            } else {
+                _mm_fmadd_ss(v, linear, old)
+            };
+            *acc = _mm_cvtss_f32(out);
+        }
+        acc.len()
+    } else {
+        done
+    }
 }
 
 /// # Safety
 /// AVX2/FMA must be available, STEP must be 1/2/4/8/16/32, and src must contain
-/// ceil(dst.len()/STEP) pixels. Only complete vector-sized runs are processed.
+/// ceil(dst.len()/STEP) pixels. Cropped tails use scalar FMA intrinsics.
 #[target_feature(enable = "avx2,fma")]
 pub(crate) fn ss2_expand_row_avx2<const STEP: usize>(
     src: &[f32],
@@ -93,8 +116,7 @@ pub(crate) fn ss2_expand_row_avx2<const STEP: usize>(
     share: f32,
 ) -> usize {
     let factor = _mm256_set1_ps(share);
-    // Fixed-size runs leave cropped tails for the scalar caller.
-    unsafe {
+    let done = unsafe {
         if STEP == 1 {
             let (runs, _) = dst.as_chunks_mut::<8>();
             let done = runs.len() * 8;
@@ -140,7 +162,15 @@ pub(crate) fn ss2_expand_row_avx2<const STEP: usize>(
             }
             done
         }
+    };
+    let factor = _mm_set_ss(share);
+    for (pixels, &v) in dst[done..].chunks_mut(STEP).zip(&src[done / STEP..]) {
+        let value = _mm_set_ss(v);
+        for out in pixels {
+            *out = _mm_cvtss_f32(_mm_fmadd_ss(value, factor, _mm_set_ss(*out)));
+        }
     }
+    dst.len()
 }
 
 /// # Safety

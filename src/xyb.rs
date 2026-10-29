@@ -76,6 +76,19 @@ fn opsin_pixel(r: f32, g: f32, b: f32) -> [f32; 3] {
 /// Row kernels convert to positive XYB and return how many pixels they handled.
 pub(crate) type XybRowsFn = unsafe fn([&[f32]; 3], [&mut [f32]; 3]) -> usize;
 
+#[derive(Clone, Copy)]
+pub(crate) struct Kernels {
+    rows: XybRowsFn,
+}
+
+impl Kernels {
+    pub(crate) fn new() -> Self {
+        Self {
+            rows: selected_xyb_rows(),
+        }
+    }
+}
+
 fn xyb_rows_scalar([r, g, b]: [&[f32]; 3], [x, y, out_b]: [&mut [f32]; 3]) -> usize {
     for i in 0..x.len() {
         let [px, py, pb] = opsin_pixel(r[i], g[i], b[i]);
@@ -107,27 +120,29 @@ fn selected_xyb_rows() -> XybRowsFn {
     })
 }
 
-/// Linear RGB → positive XYB (`X·14 + 0.42`, `Y + 0.01`, `B − Y + 0.55`).
-pub(crate) fn positive_xyb_into(lin: [&[f32]; 3], [x, y, b]: [&mut [f32]; 3]) {
-    let n = x.len();
-    assert!(lin.iter().all(|p| p.len() == n));
-    assert_eq!(y.len(), n);
-    assert_eq!(b.len(), n);
-    // SAFETY: dispatch checked the CPU features and all six slices have `n`
-    // elements; the kernel touches complete vectors only.
-    let done = unsafe { selected_xyb_rows()(lin, [&mut *x, &mut *y, &mut *b]) };
-    xyb_rows_scalar(
-        lin.map(|p| &p[done..]),
-        [&mut x[done..], &mut y[done..], &mut b[done..]],
-    );
-}
+impl Kernels {
+    /// Linear RGB → positive XYB (`X·14 + 0.42`, `Y + 0.01`, `B − Y + 0.55`).
+    pub(crate) fn positive_xyb_into(self, lin: [&[f32]; 3], [x, y, b]: [&mut [f32]; 3]) {
+        let n = x.len();
+        assert!(lin.iter().all(|p| p.len() == n));
+        assert_eq!(y.len(), n);
+        assert_eq!(b.len(), n);
+        // SAFETY: dispatch checked the CPU features and all six slices have `n`
+        // elements; the kernel touches complete vectors only.
+        let done = unsafe { (self.rows)(lin, [&mut *x, &mut *y, &mut *b]) };
+        xyb_rows_scalar(
+            lin.map(|p| &p[done..]),
+            [&mut x[done..], &mut y[done..], &mut b[done..]],
+        );
+    }
 
-pub(crate) fn positive_xyb_of_linear(lin: &[Vec<f32>; 3]) -> [Vec<f32>; 3] {
-    let n = lin[0].len();
-    let mut out = [vec![0f32; n], vec![0f32; n], vec![0f32; n]];
-    let [x, y, b] = &mut out;
-    positive_xyb_into([&lin[0], &lin[1], &lin[2]], [x, y, b]);
-    out
+    pub(crate) fn positive_xyb_of_linear(self, lin: &[Vec<f32>; 3]) -> [Vec<f32>; 3] {
+        let n = lin[0].len();
+        let mut out = [vec![0f32; n], vec![0f32; n], vec![0f32; n]];
+        let [x, y, b] = &mut out;
+        self.positive_xyb_into([&lin[0], &lin[1], &lin[2]], [x, y, b]);
+        out
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +151,7 @@ mod tests {
 
     #[test]
     fn simd_rows_match_scalar_rows() {
+        let kernels = Kernels::new();
         for n in (0..=40).chain([127, 255, 1000]) {
             let lin: [Vec<f32>; 3] = std::array::from_fn(|c| {
                 (0..n)
@@ -146,7 +162,7 @@ mod tests {
             let mut simd: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0.0; n]);
             let mut scalar = simd.clone();
             let [a, b, c] = &mut simd;
-            positive_xyb_into(input, [a, b, c]);
+            kernels.positive_xyb_into(input, [a, b, c]);
             let [a, b, c] = &mut scalar;
             xyb_rows_scalar(input, [&mut a[..], &mut b[..], &mut c[..]]);
             for (s, v) in simd.iter().zip(&scalar) {

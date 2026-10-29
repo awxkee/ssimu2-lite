@@ -33,6 +33,19 @@ use std::sync::OnceLock;
 
 type DownsampleRowsFn = fn(&[f32], &[f32], &mut [f32]) -> usize;
 
+#[derive(Clone, Copy)]
+pub(crate) struct Kernels {
+    rows: DownsampleRowsFn,
+}
+
+impl Kernels {
+    pub(crate) fn new() -> Self {
+        Self {
+            rows: selected_downsample_fn(),
+        }
+    }
+}
+
 fn selected_downsample_fn() -> DownsampleRowsFn {
     static ROWS: OnceLock<DownsampleRowsFn> = OnceLock::new();
     *ROWS.get_or_init(|| {
@@ -65,33 +78,35 @@ fn downsample_rows_scalar(top: &[f32], bottom: &[f32], dst: &mut [f32]) -> usize
     dst.len()
 }
 
-/// One output row from two input rows. A final unpaired column repeats the
-/// right edge when the destination requests ceil rather than floor width.
-pub(crate) fn downsample_rows(top: &[f32], bottom: &[f32], dst: &mut [f32]) {
-    assert_eq!(top.len(), bottom.len());
-    assert!(dst.len() <= top.len().div_ceil(2));
-    let pairs = dst.len().min(top.len() / 2);
-    let done = selected_downsample_fn()(top, bottom, &mut dst[..pairs]);
-    downsample_rows_scalar(&top[2 * done..], &bottom[2 * done..], &mut dst[done..pairs]);
-    if pairs < dst.len() {
-        let i = 2 * pairs;
-        dst[pairs] = 0.25 * (top[i] + top[i] + bottom[i] + bottom[i]);
+impl Kernels {
+    /// One output row from two input rows. A final unpaired column repeats the
+    /// right edge when the destination requests ceil rather than floor width.
+    pub(crate) fn downsample_rows(self, top: &[f32], bottom: &[f32], dst: &mut [f32]) {
+        assert_eq!(top.len(), bottom.len());
+        assert!(dst.len() <= top.len().div_ceil(2));
+        let pairs = dst.len().min(top.len() / 2);
+        let done = (self.rows)(top, bottom, &mut dst[..pairs]);
+        downsample_rows_scalar(&top[2 * done..], &bottom[2 * done..], &mut dst[done..pairs]);
+        if pairs < dst.len() {
+            let i = 2 * pairs;
+            dst[pairs] = 0.25 * (top[i] + top[i] + bottom[i] + bottom[i]);
+        }
     }
-}
 
-/// Whole-plane 2×2 box downsample with edge replication (ceil dimensions).
-pub(crate) fn downsample(a: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
-    let (nw, nh) = (w.div_ceil(2), h.div_ceil(2));
-    let mut out = vec![0f32; nw * nh];
-    for y in 0..nh {
-        let (y0, y1) = ((2 * y).min(h - 1), (2 * y + 1).min(h - 1));
-        downsample_rows(
-            &a[y0 * w..(y0 + 1) * w],
-            &a[y1 * w..(y1 + 1) * w],
-            &mut out[y * nw..(y + 1) * nw],
-        );
+    /// Whole-plane 2×2 box downsample with edge replication (ceil dimensions).
+    pub(crate) fn downsample(self, a: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
+        let (nw, nh) = (w.div_ceil(2), h.div_ceil(2));
+        let mut out = vec![0f32; nw * nh];
+        for y in 0..nh {
+            let (y0, y1) = ((2 * y).min(h - 1), (2 * y + 1).min(h - 1));
+            self.downsample_rows(
+                &a[y0 * w..(y0 + 1) * w],
+                &a[y1 * w..(y1 + 1) * w],
+                &mut out[y * nw..(y + 1) * nw],
+            );
+        }
+        (out, nw, nh)
     }
-    (out, nw, nh)
 }
 
 #[cfg(test)]
@@ -100,10 +115,11 @@ mod tests {
 
     #[test]
     fn matches_scalar_for_odd_sizes() {
+        let kernels = Kernels::new();
         for w in (1..=40).chain([63, 64, 65, 129]) {
             for h in [1, 2, 3, 9] {
                 let a: Vec<f32> = (0..w * h).map(|i| ((i * 37) % 101) as f32 / 7.0).collect();
-                let (out, nw, nh) = downsample(&a, w, h);
+                let (out, nw, nh) = kernels.downsample(&a, w, h);
                 for y in 0..nh {
                     for x in 0..nw {
                         let at = |xx: usize, yy: usize| a[yy.min(h - 1) * w + xx.min(w - 1)];

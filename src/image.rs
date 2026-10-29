@@ -30,6 +30,26 @@
 use crate::{Error, Rect};
 use std::sync::OnceLock;
 
+type CheckFn = unsafe fn(&[f32]) -> bool;
+
+#[derive(Clone, Copy)]
+pub(crate) struct Kernels {
+    check: CheckFn,
+}
+
+impl Kernels {
+    pub(crate) fn new() -> Self {
+        Self {
+            check: selected_check(),
+        }
+    }
+
+    fn has_non_finite(self, pixels: &[f32]) -> bool {
+        // SAFETY: selection checked CPU requirements; kernels respect slice bounds.
+        unsafe { (self.check)(pixels) }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Pixels<'a> {
     Srgb8(&'a [u8]),
@@ -115,7 +135,7 @@ impl<'a> RgbImage<'a> {
     }
 
     /// Linear planes of the whole image.
-    pub(crate) fn to_linear(self) -> Result<[Vec<f32>; 3], Error> {
+    pub(crate) fn to_linear(self, kernels: Kernels) -> Result<[Vec<f32>; 3], Error> {
         let n = self.width * self.height;
         let mut out = [vec![0f32; n], vec![0f32; n], vec![0f32; n]];
         let [r, g, b] = &mut out;
@@ -123,6 +143,7 @@ impl<'a> RgbImage<'a> {
             Rect::new(0, 0, self.width, self.height),
             [r, g, b],
             self.width,
+            kernels,
         )?;
         Ok(out)
     }
@@ -134,6 +155,7 @@ impl<'a> RgbImage<'a> {
         rect: Rect,
         [r, g, b]: [&mut [f32]; 3],
         out_stride: usize,
+        kernels: Kernels,
     ) -> Result<(), Error> {
         debug_assert!(rect.x1 <= self.width && rect.y1 <= self.height);
         let rows = rect.y0..rect.y1;
@@ -141,10 +163,10 @@ impl<'a> RgbImage<'a> {
             y * self.stride + rect.x0 * step..y * self.stride + rect.x1 * step
         };
         let non_finite = match self.pixels {
-            Pixels::SrgbF32(p) => rows.clone().any(|y| has_non_finite(&p[span(y, 3)])),
+            Pixels::SrgbF32(p) => rows.clone().any(|y| kernels.has_non_finite(&p[span(y, 3)])),
             Pixels::Linear(p) => rows
                 .clone()
-                .any(|y| p.iter().any(|p| has_non_finite(&p[span(y, 1)]))),
+                .any(|y| p.iter().any(|p| kernels.has_non_finite(&p[span(y, 1)]))),
             _ => false,
         };
         if non_finite {
@@ -174,10 +196,9 @@ impl<'a> RgbImage<'a> {
     }
 }
 
-fn has_non_finite(pixels: &[f32]) -> bool {
-    type CheckFn = unsafe fn(&[f32]) -> bool;
+fn selected_check() -> CheckFn {
     static CHECK: OnceLock<CheckFn> = OnceLock::new();
-    let check = CHECK.get_or_init(|| {
+    *CHECK.get_or_init(|| {
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         if std::is_x86_feature_detected!("avx2") {
             return crate::avx::has_non_finite_avx2;
@@ -192,9 +213,7 @@ fn has_non_finite(pixels: &[f32]) -> bool {
         }
         #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
         |p| p.iter().any(|v| !v.is_finite())
-    });
-    // SAFETY: dispatch checked the CPU requirements; kernels respect the slice bounds.
-    unsafe { check(pixels) }
+    })
 }
 
 fn interleaved<T: Copy>(src: &[T], [r, g, b]: [&mut [f32]; 3], f: impl Fn(T) -> f32) {
@@ -263,7 +282,7 @@ mod tests {
     #[test]
     fn vector_finite_checks_cover_every_position_and_tail() {
         #[allow(unused_mut)]
-        let mut checks: Vec<unsafe fn(&[f32]) -> bool> = vec![has_non_finite];
+        let mut checks: Vec<unsafe fn(&[f32]) -> bool> = vec![Kernels::new().check];
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
         {
             checks.push(crate::neon::has_non_finite_neon);
@@ -326,6 +345,9 @@ mod tests {
         let mut px = vec![0.5f32; 4 * 4 * 3];
         px[20] = f32::NAN;
         let img = RgbImage::srgb_f32(&px, 4, 4, 12).unwrap();
-        assert_eq!(img.to_linear().unwrap_err(), Error::NonFiniteSample);
+        assert_eq!(
+            img.to_linear(Kernels::new()).unwrap_err(),
+            Error::NonFiniteSample
+        );
     }
 }

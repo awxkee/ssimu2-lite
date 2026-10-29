@@ -37,9 +37,8 @@
 //! a per-pixel map of the linearized loss has the deficit `100 - score` as its mean.
 
 use crate::blur::GaussianBlur;
-use crate::downsample::downsample;
-use crate::maps::{MapKind, compute_edge_maps, compute_map, map_sums};
-use crate::xyb::positive_xyb_of_linear;
+use crate::dispatch::Kernels;
+use crate::maps::MapKind;
 use crate::{Error, RgbImage};
 use std::sync::{Arc, OnceLock};
 
@@ -177,17 +176,17 @@ pub(crate) fn kernel() -> &'static [f32; TAPS] {
 
 /// Pooled 1-norm and 4-norm of one map; with `acc`, also its per-pixel linearized
 /// contribution to the weighted sum (`w1·x/N + w4·x⁴/(4·N·M4^(3/4))`).
-fn pool(map: &[f32], w1: f64, w4: f64, acc: Option<&mut [f32]>) -> f64 {
+fn pool(kernels: &Kernels, map: &[f32], w1: f64, w4: f64, acc: Option<&mut [f32]>) -> f64 {
     if w1 == 0.0 && w4 == 0.0 {
         return 0.0;
     }
     let n = map.len() as f64;
-    let (s1, s4) = map_sums(map);
+    let (s1, s4) = kernels.maps.map_sums(map);
     let m1 = s1 / n;
     let m4 = s4 / n;
     let n4 = m4.sqrt().sqrt();
     if let Some(acc) = acc {
-        add_map_contribution(map, w1, w4, n4, acc);
+        add_map_contribution(kernels.error_map, map, w1, w4, n4, acc);
     }
     w1 * m1 + w4 * n4
 }
@@ -195,8 +194,15 @@ fn pool(map: &[f32], w1: f64, w4: f64, acc: Option<&mut [f32]>) -> f64 {
 /// Compute the pixel contribution in f32. Normalizing by the fourth norm
 /// keeps the fourth powers bounded by the pixel count, even for HDR maps.
 /// The pooled totals and final score stay f64, including incremental deltas.
-pub(crate) fn add_map_contribution(map: &[f32], w1: f64, w4: f64, n4: f64, acc: &mut [f32]) {
-    PooledContribution::new(map.len(), w1, w4, n4).add(map, acc);
+pub(crate) fn add_map_contribution(
+    kernels: &MapKernels,
+    map: &[f32],
+    w1: f64,
+    w4: f64,
+    n4: f64,
+    acc: &mut [f32],
+) {
+    PooledContribution::new(map.len(), w1, w4, n4).add(kernels, map, acc);
 }
 
 /// Coefficients for a whole map, reusable when processing it one row at a time.
@@ -234,9 +240,9 @@ impl PooledContribution {
         }
     }
 
-    pub(crate) fn add(self, map: &[f32], acc: &mut [f32]) {
+    pub(crate) fn add(self, kernels: &MapKernels, map: &[f32], acc: &mut [f32]) {
         match self {
-            Self::F32(p) => contribute(map, p, acc),
+            Self::F32(p) => kernels.contribute(map, p, acc),
             Self::F64 { linear, fourth } => {
                 for (a, &v) in acc.iter_mut().zip(map) {
                     let v = v as f64;
@@ -258,13 +264,13 @@ pub(crate) struct MapContribution {
 type ContributionFn = unsafe fn(&[f32], MapContribution, &mut [f32]) -> usize;
 type ExpandRowFn = unsafe fn(&[f32], &mut [f32], f32) -> usize;
 
-struct MapKernels {
+pub(crate) struct MapKernels {
     contribution: ContributionFn,
     fused: bool,
     expand: [ExpandRowFn; NUM_SCALES],
 }
 
-fn map_kernels() -> &'static MapKernels {
+pub(crate) fn map_kernels() -> &'static MapKernels {
     static KERNELS: OnceLock<MapKernels> = OnceLock::new();
     KERNELS.get_or_init(|| {
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
@@ -341,24 +347,15 @@ pub(crate) fn contribution_scalar(map: &[f32], p: MapContribution, acc: &mut [f3
     acc.len()
 }
 
-fn contribute(map: &[f32], p: MapContribution, acc: &mut [f32]) {
-    assert_eq!(map.len(), acc.len());
-    // SAFETY: dispatch checked the CPU features and both slices have equal
-    // lengths. The kernel reads/writes complete vectors and returns its prefix.
-    let done = unsafe { (map_kernels().contribution)(map, p, acc) };
-    // Match the selected kernel's arithmetic in its short tail.
-    if !map_kernels().fused {
+impl MapKernels {
+    fn contribute(&self, map: &[f32], p: MapContribution, acc: &mut [f32]) {
+        assert_eq!(map.len(), acc.len());
+        // SAFETY: dispatch checked the CPU features and both slices have equal
+        // lengths. The kernel stays inside both slices and returns its prefix.
+        let done = unsafe { (self.contribution)(map, p, acc) };
+        // FMA backends consume their tails inside the feature-gated kernels.
+        debug_assert!(!self.fused || done == map.len());
         contribution_scalar(&map[done..], p, &mut acc[done..]);
-        return;
-    }
-    for (a, &v) in acc[done..].iter_mut().zip(&map[done..]) {
-        if p.norm_weight == 0.0 {
-            *a = p.linear.mul_add(v, *a);
-        } else {
-            let normalized = v * p.inv_norm;
-            let square = normalized * normalized;
-            *a += (p.norm_weight * square).mul_add(square, p.linear * v);
-        }
     }
 }
 
@@ -380,33 +377,38 @@ fn expand_row_scalar<const STEP: usize>(src: &[f32], dst: &mut [f32], share: f32
     dst.len()
 }
 
-/// Spread a scale's contribution in contiguous runs. Each source pixel covers
-/// STEP×STEP pixels, with the last run cropped at odd image edges.
-pub(crate) fn accumulate_scale_map(
-    acc: &[f32],
-    w0: usize,
-    h0: usize,
-    scale: usize,
-    map: &mut [f32],
-) {
-    let step = 1usize << scale;
-    let w = w0.div_ceil(step);
-    let h = h0.div_ceil(step);
-    assert_eq!(acc.len(), w * h);
-    assert_eq!(map.len(), w0 * h0);
-    if map.is_empty() {
-        return;
-    }
-    let share = 1.0 / (step * step) as f32;
-    let expand = map_kernels().expand[scale];
-    for (src, rows) in acc.chunks_exact(w).zip(map.chunks_mut(w0 * step)) {
-        for row in rows.chunks_exact_mut(w0) {
-            // SAFETY: dispatch checked CPU features. `src` has ceil(row/STEP)
-            // pixels and the specialized kernel handles only complete runs.
-            let done = unsafe { expand(src, row, share) };
-            for (pixels, &v) in row[done..].chunks_mut(step).zip(&src[done / step..]) {
-                for out in pixels {
-                    *out = v.mul_add(share, *out);
+impl MapKernels {
+    /// Spread a scale's contribution in contiguous runs. Each source pixel covers
+    /// STEP×STEP pixels, with the last run cropped at odd image edges.
+    pub(crate) fn accumulate_scale_map(
+        &self,
+        acc: &[f32],
+        w0: usize,
+        h0: usize,
+        scale: usize,
+        map: &mut [f32],
+    ) {
+        let step = 1usize << scale;
+        let w = w0.div_ceil(step);
+        let h = h0.div_ceil(step);
+        assert_eq!(acc.len(), w * h);
+        assert_eq!(map.len(), w0 * h0);
+        if map.is_empty() {
+            return;
+        }
+        let share = 1.0 / (step * step) as f32;
+        let expand = self.expand[scale];
+        for (src, rows) in acc.chunks_exact(w).zip(map.chunks_mut(w0 * step)) {
+            for row in rows.chunks_exact_mut(w0) {
+                // SAFETY: dispatch checked CPU features. `src` has ceil(row/STEP)
+                // pixels and the specialized kernel stays inside both slices.
+                let done = unsafe { expand(src, row, share) };
+                debug_assert!(!self.fused || done == row.len());
+                for (pixels, &v) in row[done..].chunks_mut(step).zip(&src[done / step..]) {
+                    let contribution = v * share;
+                    for out in pixels {
+                        *out += contribution;
+                    }
                 }
             }
         }
@@ -453,9 +455,10 @@ pub(crate) struct ReferenceData {
     pub(crate) width: usize,
     pub(crate) height: usize,
     pub(crate) scales: Vec<ReferenceScale>,
+    pub(crate) kernels: Kernels,
 }
 
-/// A reference image analysed once, to be compared with many test images.
+/// A reference image analyzed once, to be compared with many test images.
 ///
 /// Holds the reference's XYB pyramid and its blurred moments, so a comparison
 /// only processes the test image. Cloning is cheap (shared data).
@@ -471,19 +474,20 @@ impl PreparedReference {
         if w0 < MIN_SIZE || h0 < MIN_SIZE {
             return Err(Error::ImageTooSmall);
         }
-        let mut lin = image.to_linear()?;
+        let kernels = Kernels::new();
+        let mut lin = image.to_linear(kernels.image)?;
         let dims = scale_dims(w0, h0);
-        let mut blur = GaussianBlur::with_kernel(w0, *kernel(), true);
+        let mut blur = GaussianBlur::with_kernels(w0, *kernel(), true, kernels.blur);
         let count = dims.clone().count();
         let mut scales = Vec::with_capacity(count);
         let (mut pw, mut ph) = (w0, h0);
         for (scale, (w, h)) in dims.enumerate() {
             if scale > 0 {
                 for plane in &mut lin {
-                    *plane = downsample(plane, pw, ph).0;
+                    *plane = kernels.downsample.downsample(plane, pw, ph).0;
                 }
             }
-            let xyb = positive_xyb_of_linear(&lin);
+            let xyb = kernels.xyb.positive_xyb_of_linear(&lin);
             blur.set_width(w);
             let mut mu: [Vec<f32>; 3] = Default::default();
             let mut sigma: [Vec<f32>; 3] = Default::default();
@@ -512,6 +516,7 @@ impl PreparedReference {
                 width: w0,
                 height: h0,
                 scales,
+                kernels,
             }),
         })
     }
@@ -545,8 +550,9 @@ impl PreparedReference {
             return Err(Error::DimensionMismatch);
         }
         let (w0, h0) = (d.width, d.height);
-        let mut lin = test.to_linear()?;
-        let mut blur = GaussianBlur::with_kernel(w0, *kernel(), true);
+        let kernels = &d.kernels;
+        let mut lin = test.to_linear(kernels.image)?;
+        let mut blur = GaussianBlur::with_kernels(w0, *kernel(), true, kernels.blur);
         let mut moments: [Vec<f32>; 3] = Default::default();
         let mut ssim = Vec::new();
         let mut acc = Vec::new();
@@ -561,10 +567,13 @@ impl PreparedReference {
             if s > 0 {
                 let previous = &d.scales[s - 1];
                 for plane in &mut lin {
-                    *plane = downsample(plane, previous.width, previous.height).0;
+                    *plane = kernels
+                        .downsample
+                        .downsample(plane, previous.width, previous.height)
+                        .0;
                 }
             }
-            let xyb = positive_xyb_of_linear(&lin);
+            let xyb = kernels.xyb.positive_xyb_of_linear(&lin);
             blur.set_width(w);
             for buffer in &mut moments {
                 buffer.resize(w * h, 0.0);
@@ -595,12 +604,15 @@ impl PreparedReference {
                 if active[0] {
                     blur.blur_moments([src, rec], h, [mu2, s22, s12]);
                     ssim.resize(w * h, 0.0);
-                    compute_map(MapKind::Ssim, [mu1, mu2, s11, s22, s12], &mut ssim);
+                    kernels
+                        .maps
+                        .compute_map(MapKind::Ssim, [mu1, mu2, s11, s22, s12], &mut ssim);
                 } else {
                     blur.blur(rec, h, mu2);
                 }
                 let base = weight_base(c, s, d.scales.len());
                 sum += pool(
+                    kernels,
                     &ssim,
                     WEIGHTS[base],
                     WEIGHTS[base + 3],
@@ -611,15 +623,22 @@ impl PreparedReference {
                 let (artifact, detail) = (s22, s12);
                 let edge_inputs = [&src[..], &rec[..], &mu1[..], &mu2[..], &src[..]];
                 if active[1] && active[2] {
-                    compute_edge_maps(edge_inputs, [artifact, detail]);
+                    kernels
+                        .maps
+                        .compute_edge_maps(edge_inputs, [artifact, detail]);
                 } else if active[1] {
-                    compute_map(MapKind::Artifact, edge_inputs, artifact);
+                    kernels
+                        .maps
+                        .compute_map(MapKind::Artifact, edge_inputs, artifact);
                 } else if active[2] {
-                    compute_map(MapKind::Detail, edge_inputs, detail);
+                    kernels
+                        .maps
+                        .compute_map(MapKind::Detail, edge_inputs, detail);
                 }
                 for (m, values) in [artifact, detail].into_iter().enumerate() {
                     let acc = scale_acc.as_deref_mut();
                     sum += pool(
+                        kernels,
                         values,
                         WEIGHTS[base + m + 1],
                         WEIGHTS[base + 3 + m + 1],
@@ -628,7 +647,9 @@ impl PreparedReference {
                 }
             }
             if want_map && s > 0 {
-                accumulate_scale_map(&acc, w0, h0, s, &mut map);
+                kernels
+                    .error_map
+                    .accumulate_scale_map(&acc, w0, h0, s, &mut map);
             }
         }
         if want_map {
@@ -707,10 +728,10 @@ mod tests {
                 for (w1, w4) in [(1.0, 0.0), (0.0, 2.0), (0.3, 0.5)] {
                     let mut whole = vec![0.001; map.len()];
                     let mut rows = whole.clone();
-                    add_map_contribution(&map, w1, w4, n4, &mut whole);
+                    add_map_contribution(map_kernels(), &map, w1, w4, n4, &mut whole);
                     let coefficient = PooledContribution::new(map.len(), w1, w4, n4);
                     for (src, dst) in map.chunks_exact(w).zip(rows.chunks_exact_mut(w)) {
-                        coefficient.add(src, dst);
+                        coefficient.add(map_kernels(), src, dst);
                     }
                     for (a, b) in whole.iter().zip(rows) {
                         assert_eq!(
@@ -756,6 +777,9 @@ mod tests {
                             )
                         };
                         assert!(done <= n);
+                        if fused {
+                            assert_eq!(done, n, "{name} must consume its fused tail");
+                        }
                         for i in 0..n {
                             let v = input[offset + i];
                             let expected = if i >= done {
@@ -788,7 +812,7 @@ mod tests {
 
                         if name == "dispatch" {
                             let mut actual = initial.clone();
-                            contribute(&input[offset..offset + n], p, &mut actual);
+                            kernels.contribute(&input[offset..offset + n], p, &mut actual);
                             for i in done..n {
                                 let v = input[offset + i];
                                 let normalized = v * p.inv_norm;
@@ -820,7 +844,7 @@ mod tests {
     #[test]
     fn scale_expansion_covers_all_scales_and_cropped_edges() {
         const GUARD: f32 = -12345.0;
-        for (name, kernels, _) in test_kernels() {
+        for (name, kernels, fused) in test_kernels() {
             for scale in 0..NUM_SCALES {
                 let step = 1 << scale;
                 let share = 1.0 / (step * step) as f32;
@@ -847,6 +871,9 @@ mod tests {
                             )
                         };
                         assert!(done <= width && (done == width || done.is_multiple_of(step)));
+                        if fused {
+                            assert_eq!(done, width, "{name} must consume its fused tail");
+                        }
                         for i in 0..width {
                             let expected = initial[i]
                                 + if i < done {
@@ -878,9 +905,46 @@ mod tests {
                                 expected[y * width + x] += acc[(y / step) * n + x / step] * share;
                             }
                         }
-                        accumulate_scale_map(&acc, width, height, scale, &mut actual);
+                        kernels.accumulate_scale_map(&acc, width, height, scale, &mut actual);
                         assert_eq!(actual, expected, "scale={scale}, {width}x{height}");
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scale_expansion_tails_match_backend_rounding_for_subnormals() {
+        const GUARD: f32 = -12345.0;
+        for (name, kernels, fused) in test_kernels() {
+            for scale in 1..NUM_SCALES {
+                let step = 1 << scale;
+                let share = 1.0 / (step * step) as f32;
+                let initial = f32::from_bits(1);
+                // The product rounds to zero before addition, but fused with
+                // `initial` it rounds up to two minimum subnormals.
+                let value = f32::from_bits(1 << (2 * scale - 1));
+                let expected = if fused {
+                    value.mul_add(share, initial)
+                } else {
+                    initial + value * share
+                };
+                assert_eq!(expected.to_bits(), if fused { 2 } else { 1 });
+                for width in (1usize..=2 * step + 17).chain([127, 129]) {
+                    let src = vec![value; width.div_ceil(step)];
+                    let mut map = vec![initial; width + 2];
+                    map[0] = GUARD;
+                    map[width + 1] = GUARD;
+                    kernels.accumulate_scale_map(&src, width, 1, scale, &mut map[1..width + 1]);
+                    for &v in &map[1..width + 1] {
+                        assert_eq!(
+                            v.to_bits(),
+                            expected.to_bits(),
+                            "{name}, scale={scale}, width={width}"
+                        );
+                    }
+                    assert_eq!(map[0], GUARD);
+                    assert_eq!(map[width + 1], GUARD);
                 }
             }
         }
@@ -915,6 +979,7 @@ mod tests {
 
     #[test]
     fn pooling_matches_f64_for_sparse_maps_tails_and_extreme_norms() {
+        let kernels = Kernels::new();
         let mut max_relative_error = 0.0f32;
         for n in (1..=17).chain([31, 257, 4099, 307_200]) {
             for magnitude in [0.0, 1e-44, 1e-32, 1e-20, 1e-7, 1.0, 1e5, 1e20, 1e37] {
@@ -935,7 +1000,13 @@ mod tests {
                         for m in 0..3 {
                             actual.fill(0.0);
                             expected.fill(0.0);
-                            let sum = pool(&map, weights[m], weights[m + 3], Some(&mut actual));
+                            let sum = pool(
+                                &kernels,
+                                &map,
+                                weights[m],
+                                weights[m + 3],
+                                Some(&mut actual),
+                            );
                             let reference =
                                 reference_pool(&map, weights[m], weights[m + 3], &mut expected);
                             assert!(

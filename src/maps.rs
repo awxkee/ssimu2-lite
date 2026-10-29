@@ -78,7 +78,7 @@ type EdgesFn = unsafe fn(MapInputs<'_>, [&mut [f32]; 2], &mut [MapSums; 2]) -> u
 type SumsFn = unsafe fn(&[f32], &mut MapSums) -> usize;
 
 #[derive(Clone, Copy)]
-struct Kernels {
+pub(crate) struct Kernels {
     compute: [MapFn; 3],
     replace: [[MapFn; 2]; 3],
     sums: SumsFn,
@@ -123,7 +123,7 @@ macro_rules! kernels {
 #[cfg(any(test, not(all(target_arch = "aarch64", feature = "neon"))))]
 const SCALAR: Kernels = kernels!(maps, map_scalar, sums_scalar, edges_scalar);
 
-fn selected_kernels() -> &'static Kernels {
+pub(crate) fn selected_kernels() -> &'static Kernels {
     static KERNELS: OnceLock<Kernels> = OnceLock::new();
     KERNELS.get_or_init(|| {
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
@@ -201,46 +201,48 @@ fn sums_scalar(map: &[f32], sums: &mut MapSums) -> usize {
     map.len()
 }
 
-pub(crate) fn map_sums(map: &[f32]) -> (f64, f64) {
-    let mut sums = MapSums::default();
-    // SAFETY: dispatch checked CPU features; kernels read complete vectors.
-    let done = unsafe { (selected_kernels().sums)(map, &mut sums) };
-    for (i, &v) in map.iter().enumerate().skip(done) {
-        sums.add::<false, true>(i, v, 0.0);
+impl Kernels {
+    pub(crate) fn map_sums(&self, map: &[f32]) -> (f64, f64) {
+        let mut sums = MapSums::default();
+        // SAFETY: dispatch checked CPU features; kernels read complete vectors.
+        let done = unsafe { (self.sums)(map, &mut sums) };
+        for (i, &v) in map.iter().enumerate().skip(done) {
+            sums.add::<false, true>(i, v, 0.0);
+        }
+        sums.total()
     }
-    sums.total()
-}
 
-pub(crate) fn compute_map(kind: MapKind, inputs: MapInputs<'_>, map: &mut [f32]) {
-    assert!(inputs.iter().all(|p| p.len() == map.len()));
-    let mut unused = MapSums::default();
-    // SAFETY: dispatch checked CPU features and every input matches the output.
-    let done = unsafe { (selected_kernels().compute[kind as usize])(inputs, map, &mut unused) };
-    map_tail::<false, false>(kind as usize, inputs, map, &mut unused, done);
-}
-
-pub(crate) fn replace_map(
-    kind: MapKind,
-    inputs: MapInputs<'_>,
-    map: &mut [f32],
-    sums: &mut (f64, f64),
-    fourth: bool,
-) {
-    assert!(inputs.iter().all(|p| p.len() == map.len()));
-    let mut delta = MapSums::default();
-    // SAFETY: dispatch checked CPU features and every input matches the output.
-    let done = unsafe {
-        (selected_kernels().replace[kind as usize][usize::from(fourth)])(inputs, map, &mut delta)
-    };
-    if fourth {
-        map_tail::<true, true>(kind as usize, inputs, map, &mut delta, done);
-    } else {
-        map_tail::<true, false>(kind as usize, inputs, map, &mut delta, done);
+    pub(crate) fn compute_map(&self, kind: MapKind, inputs: MapInputs<'_>, map: &mut [f32]) {
+        assert!(inputs.iter().all(|p| p.len() == map.len()));
+        let mut unused = MapSums::default();
+        // SAFETY: dispatch checked CPU features and every input matches the output.
+        let done = unsafe { (self.compute[kind as usize])(inputs, map, &mut unused) };
+        map_tail::<false, false>(kind as usize, inputs, map, &mut unused, done);
     }
-    let delta = delta.total();
-    sums.0 += delta.0;
-    if fourth {
-        sums.1 += delta.1;
+
+    pub(crate) fn replace_map(
+        &self,
+        kind: MapKind,
+        inputs: MapInputs<'_>,
+        map: &mut [f32],
+        sums: &mut (f64, f64),
+        fourth: bool,
+    ) {
+        assert!(inputs.iter().all(|p| p.len() == map.len()));
+        let mut delta = MapSums::default();
+        // SAFETY: dispatch checked CPU features and every input matches the output.
+        let done =
+            unsafe { self.replace[kind as usize][usize::from(fourth)](inputs, map, &mut delta) };
+        if fourth {
+            map_tail::<true, true>(kind as usize, inputs, map, &mut delta, done);
+        } else {
+            map_tail::<true, false>(kind as usize, inputs, map, &mut delta, done);
+        }
+        let delta = delta.total();
+        sums.0 += delta.0;
+        if fourth {
+            sums.1 += delta.1;
+        }
     }
 }
 
@@ -274,50 +276,55 @@ fn edges_scalar<const REPLACE: bool, const ARTIFACT_FOURTH: bool, const DETAIL_F
     n
 }
 
-pub(crate) fn compute_edge_maps(inputs: MapInputs<'_>, [artifact, detail]: [&mut [f32]; 2]) {
-    let n = artifact.len();
-    assert_eq!(detail.len(), n);
-    assert!(inputs.iter().all(|p| p.len() == n));
-    let mut unused = std::array::from_fn(|_| MapSums::default());
-    // SAFETY: dispatch checked features; every input and output has n elements.
-    let done = unsafe { (selected_kernels().edges)(inputs, [artifact, detail], &mut unused) };
-    edges_tail::<false, false, false>(inputs, [artifact, detail], &mut unused, done);
-}
-
-pub(crate) fn replace_edge_maps(
-    inputs: MapInputs<'_>,
-    [artifact, detail]: [&mut [f32]; 2],
-    sums: [&mut (f64, f64); 2],
-    fourth: [bool; 2],
-) {
-    let n = artifact.len();
-    assert_eq!(detail.len(), n);
-    assert!(inputs.iter().all(|p| p.len() == n));
-    let which = usize::from(fourth[0]) + 2 * usize::from(fourth[1]);
-    let mut delta = std::array::from_fn(|_| MapSums::default());
-    // SAFETY: dispatch checked features; every input and output has n elements.
-    let done = unsafe {
-        (selected_kernels().replace_edges[which])(inputs, [artifact, detail], &mut delta)
-    };
-    match fourth {
-        [false, false] => {
-            edges_tail::<true, false, false>(inputs, [artifact, detail], &mut delta, done)
-        }
-        [true, false] => {
-            edges_tail::<true, true, false>(inputs, [artifact, detail], &mut delta, done)
-        }
-        [false, true] => {
-            edges_tail::<true, false, true>(inputs, [artifact, detail], &mut delta, done)
-        }
-        [true, true] => {
-            edges_tail::<true, true, true>(inputs, [artifact, detail], &mut delta, done)
-        }
+impl Kernels {
+    pub(crate) fn compute_edge_maps(
+        &self,
+        inputs: MapInputs<'_>,
+        [artifact, detail]: [&mut [f32]; 2],
+    ) {
+        let n = artifact.len();
+        assert_eq!(detail.len(), n);
+        assert!(inputs.iter().all(|p| p.len() == n));
+        let mut unused = std::array::from_fn(|_| MapSums::default());
+        // SAFETY: dispatch checked features; every input and output has n elements.
+        let done = unsafe { (self.edges)(inputs, [artifact, detail], &mut unused) };
+        edges_tail::<false, false, false>(inputs, [artifact, detail], &mut unused, done);
     }
-    for ((sum, delta), fourth) in sums.into_iter().zip(delta).zip(fourth) {
-        let delta = delta.total();
-        sum.0 += delta.0;
-        if fourth {
-            sum.1 += delta.1;
+
+    pub(crate) fn replace_edge_maps(
+        &self,
+        inputs: MapInputs<'_>,
+        [artifact, detail]: [&mut [f32]; 2],
+        sums: [&mut (f64, f64); 2],
+        fourth: [bool; 2],
+    ) {
+        let n = artifact.len();
+        assert_eq!(detail.len(), n);
+        assert!(inputs.iter().all(|p| p.len() == n));
+        let which = usize::from(fourth[0]) + 2 * usize::from(fourth[1]);
+        let mut delta = std::array::from_fn(|_| MapSums::default());
+        // SAFETY: dispatch checked features; every input and output has n elements.
+        let done = unsafe { self.replace_edges[which](inputs, [artifact, detail], &mut delta) };
+        match fourth {
+            [false, false] => {
+                edges_tail::<true, false, false>(inputs, [artifact, detail], &mut delta, done)
+            }
+            [true, false] => {
+                edges_tail::<true, true, false>(inputs, [artifact, detail], &mut delta, done)
+            }
+            [false, true] => {
+                edges_tail::<true, false, true>(inputs, [artifact, detail], &mut delta, done)
+            }
+            [true, true] => {
+                edges_tail::<true, true, true>(inputs, [artifact, detail], &mut delta, done)
+            }
+        }
+        for ((sum, delta), fourth) in sums.into_iter().zip(delta).zip(fourth) {
+            let delta = delta.total();
+            sum.0 += delta.0;
+            if fourth {
+                sum.1 += delta.1;
+            }
         }
     }
 }
@@ -458,8 +465,8 @@ mod tests {
                 let inputs = input.each_ref().map(|p| &p[..]);
                 let mut expected: [Vec<f32>; 2] = std::array::from_fn(|_| vec![0.0; n]);
                 let [a, d] = &mut expected;
-                compute_map(MapKind::Artifact, inputs, a);
-                compute_map(MapKind::Detail, inputs, d);
+                kernels.compute_map(MapKind::Artifact, inputs, a);
+                kernels.compute_map(MapKind::Detail, inputs, d);
                 let mut output = [vec![GUARD; n + 2], vec![GUARD; n + 2]];
                 let [a, d] = &mut output;
                 let mut unused = std::array::from_fn(|_| MapSums::default());
@@ -559,7 +566,7 @@ mod tests {
                         actual.fourth, expected.fourth,
                         "fourth: {name}, n={n}, magnitude={magnitude}"
                     );
-                    assert_eq!(map_sums(&map), expected.total());
+                    assert_eq!(kernels.map_sums(&map), expected.total());
                 }
             }
         }

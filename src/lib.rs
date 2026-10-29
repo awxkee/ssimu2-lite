@@ -85,6 +85,7 @@
 #[cfg(all(feature = "avx", target_arch = "x86_64"))]
 mod avx;
 mod blur;
+mod dispatch;
 mod downsample;
 mod image;
 mod incremental;

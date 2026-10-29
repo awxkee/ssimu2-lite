@@ -80,20 +80,36 @@ fn contribution<const N: usize, const FOURTH: bool>(
             }
         }
     }
-    done
+    // The final pass keeps fused tails inside the feature-gated kernel too.
+    if N == 1 {
+        let linear = vdup_n_f32(p.linear);
+        for (&v, acc) in map[done..].iter().zip(&mut acc[done..]) {
+            *acc = if FOURTH {
+                let normalized = v * p.inv_norm;
+                let square = normalized * normalized;
+                let weighted = square * p.norm_weight;
+                let first = v * p.linear;
+                *acc + vfmas_lane_f32::<0>(first, weighted, vdup_n_f32(square))
+            } else {
+                vfmas_lane_f32::<0>(*acc, v, linear)
+            };
+        }
+        acc.len()
+    } else {
+        done
+    }
 }
 
 /// # Safety
 /// NEON must be available, STEP must be 1/2/4/8/16/32, and src must contain
-/// ceil(dst.len()/STEP) pixels. Only complete vector-sized runs are processed.
+/// ceil(dst.len()/STEP) pixels. Cropped tails use scalar NEON FMA intrinsics.
 #[target_feature(enable = "neon")]
 pub(crate) fn ss2_expand_row_neon<const STEP: usize>(
     src: &[f32],
     dst: &mut [f32],
     share: f32,
 ) -> usize {
-    // Fixed-size runs leave cropped tails for the scalar caller.
-    unsafe {
+    let done = unsafe {
         if STEP == 1 {
             let (runs, _) = dst.as_chunks_mut::<4>();
             let done = runs.len() * 4;
@@ -128,7 +144,14 @@ pub(crate) fn ss2_expand_row_neon<const STEP: usize>(
             }
             done
         }
+    };
+    let factor = vdup_n_f32(share);
+    for (pixels, &v) in dst[done..].chunks_mut(STEP).zip(&src[done / STEP..]) {
+        for out in pixels {
+            *out = vfmas_lane_f32::<0>(*out, v, factor);
+        }
     }
+    dst.len()
 }
 
 /// # Safety

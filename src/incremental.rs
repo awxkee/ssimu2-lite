@@ -34,7 +34,7 @@
 //! (plus the blur halo) at every scale and adjusts the sums; the score
 //! then costs a few hundred flops.
 
-use crate::blur::GaussianBlur;
+use crate::blur::{GaussianBlur, VERTICAL_BATCH};
 use crate::dispatch::Kernels;
 use crate::maps::MapKind;
 use crate::metric::{
@@ -94,13 +94,32 @@ pub struct Checkpoint {
     sums: Vec<[[(f64, f64); 3]; 3]>,
 }
 
-fn save_rows(buf: &[f32], w: usize, r: Rect, out: &mut Vec<f32>) {
+/// Copy a short row without a library call: checkpoints move thousands of
+/// rows of a few dozen samples per update, where `memcpy` call overhead
+/// outweighs the copy itself.
+#[inline(always)]
+fn copy_row(dst: &mut [f32], src: &[f32]) {
+    assert_eq!(dst.len(), src.len());
+    let (dst_vectors, dst_tail) = dst.as_chunks_mut::<8>();
+    let (src_vectors, src_tail) = src.as_chunks::<8>();
+    for (d, s) in dst_vectors.iter_mut().zip(src_vectors) {
+        *d = *s;
+    }
+    for (d, &s) in dst_tail.iter_mut().zip(src_tail) {
+        *d = s;
+    }
+}
+
+fn save_rows(buf: &[f32], w: usize, r: Rect, out: &mut [f32], mut at: usize) -> usize {
     if buf.is_empty() {
-        return;
+        return at;
     }
+    let n = r.x1 - r.x0;
     for y in r.y0..r.y1 {
-        out.extend_from_slice(&buf[y * w + r.x0..y * w + r.x1]);
+        copy_row(&mut out[at..at + n], &buf[y * w + r.x0..y * w + r.x1]);
+        at += n;
     }
+    at
 }
 
 fn load_rows(buf: &mut [f32], w: usize, r: Rect, data: &[f32], mut at: usize) -> usize {
@@ -109,10 +128,103 @@ fn load_rows(buf: &mut [f32], w: usize, r: Rect, data: &[f32], mut at: usize) ->
     }
     let n = r.x1 - r.x0;
     for y in r.y0..r.y1 {
-        buf[y * w + r.x0..y * w + r.x1].copy_from_slice(&data[at..at + n]);
+        copy_row(&mut buf[y * w + r.x0..y * w + r.x1], &data[at..at + n]);
         at += n;
     }
     at
+}
+
+/// Filtered moment planes a plane's row cache holds.
+fn moment_planes(active: [bool; 3]) -> usize {
+    if active[0] {
+        3
+    } else if active.contains(&true) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Slots of a row cache; one vertical batch needs `VERTICAL_BATCH + 2·RADIUS`.
+const ROW_SLOTS: usize = 64;
+const _: () = assert!(VERTICAL_BATCH + 2 * RADIUS <= ROW_SLOTS);
+
+/// Horizontally filtered test moments of one plane at one scale, for a band
+/// of recent rows: slot `y % ROW_SLOTS` holds row `y`, valid over one column
+/// interval. Missing columns are filtered on demand, so a scan in raster
+/// order filters each halo row about once instead of once per update.
+struct FilteredRows {
+    /// Filtered planes per row (see [`moment_planes`]).
+    planes: usize,
+    width: usize,
+    /// `ROW_SLOTS` rows of `planes` planes of `width` samples.
+    data: Vec<f32>,
+    /// Source row held by each slot (`usize::MAX` for none).
+    row: [usize; ROW_SLOTS],
+    /// Valid columns of each slot.
+    valid: [(usize, usize); ROW_SLOTS],
+}
+
+impl FilteredRows {
+    fn new(planes: usize, width: usize) -> Self {
+        Self {
+            planes,
+            width,
+            data: vec![0.0; ROW_SLOTS * planes * width],
+            row: [usize::MAX; ROW_SLOTS],
+            valid: [(0, 0); ROW_SLOTS],
+        }
+    }
+
+    /// Forget rows whose test samples changed.
+    fn invalidate(&mut self, rows: std::ops::Range<usize>) {
+        for y in rows {
+            let slot = y % ROW_SLOTS;
+            if self.row[slot] == y {
+                self.row[slot] = usize::MAX;
+            }
+        }
+    }
+
+    /// Filter whatever part of `columns` of `rows` the cache lacks.
+    fn fill(
+        &mut self,
+        blur: &mut GaussianBlur,
+        inputs: [&[f32]; 2],
+        rows: std::ops::Range<usize>,
+        columns: std::ops::Range<usize>,
+    ) {
+        let len = self.planes * self.width;
+        for y in rows {
+            let slot = y % ROW_SLOTS;
+            if self.row[slot] != y {
+                self.row[slot] = y;
+                self.valid[slot] = (0, 0);
+            }
+            let (a, b) = self.valid[slot];
+            let dst = &mut self.data[slot * len..(slot + 1) * len];
+            if a < b && columns.start <= b && a <= columns.end {
+                // Overlapping or adjacent: extend the valid interval.
+                if columns.start < a {
+                    blur.horizontal_row(inputs, self.width, y, columns.start..a, self.planes, dst);
+                }
+                if b < columns.end {
+                    blur.horizontal_row(inputs, self.width, y, b..columns.end, self.planes, dst);
+                }
+                self.valid[slot] = (a.min(columns.start), b.max(columns.end));
+            } else {
+                blur.horizontal_row(inputs, self.width, y, columns.clone(), self.planes, dst);
+                self.valid[slot] = (columns.start, columns.end);
+            }
+        }
+    }
+
+    fn row(&self, y: usize) -> &[f32] {
+        let len = self.planes * self.width;
+        let slot = y % ROW_SLOTS;
+        debug_assert_eq!(self.row[slot], y);
+        &self.data[slot * len..(slot + 1) * len]
+    }
 }
 
 /// SSIMULACRA 2 of a fixed reference against a test image that changes
@@ -129,6 +241,12 @@ pub struct IncrementalState {
     xyb: Vec<[Vec<f32>; 3]>,
     /// Reused region-sized mean, square and cross-product scratch.
     moments: [Vec<f32>; 3],
+    /// Horizontally filtered test moments per scale and plane for a band of
+    /// rows: the mean, square and cross-product (only the mean when the plane
+    /// has no SSIM map). Updates refilter only rows whose samples changed.
+    filtered: Vec<[FilteredRows; 3]>,
+    /// Zero rows standing in for rows outside the plane in the vertical pass.
+    zero: Vec<f32>,
     /// Maps per scale, plane: ssim, artifact, detail. Unweighted maps are empty.
     maps: Vec<[[Vec<f32>; 3]; 3]>,
     /// Pooled sums per scale, plane, map: (Σx, Σx⁴). Unweighted fourth sums
@@ -155,6 +273,8 @@ impl IncrementalState {
             lin: Vec::with_capacity(scales),
             xyb: Vec::with_capacity(scales),
             moments: Default::default(),
+            filtered: Vec::with_capacity(scales),
+            zero: vec![0.0; 3 * test.width()],
             maps: Vec::with_capacity(scales),
             sums: Vec::with_capacity(scales),
         };
@@ -182,7 +302,11 @@ impl IncrementalState {
                 std::array::from_fn(|m| buffer(active[c][m]))
             }));
             st.sums.push([[(0.0, 0.0); 3]; 3]);
-            st.refresh_moments_and_maps(s, Rect::new(0, 0, w, h));
+            st.filtered.push(std::array::from_fn(|c| {
+                FilteredRows::new(moment_planes(active[c]), w)
+            }));
+            let whole = Rect::new(0, 0, w, h);
+            st.refresh_moments_and_maps(s, whole, whole);
         }
         // Initialization covers whole scales; local updates should retain only
         // the scratch they actually need, rather than these full-frame buffers.
@@ -210,8 +334,9 @@ impl IncrementalState {
     }
 
     /// Recompute the weighted maps and their test moments at scale `s` over
-    /// `r` (whose inputs changed within `r` shrunk by the blur radius).
-    fn refresh_moments_and_maps(&mut self, s: usize, r: Rect) {
+    /// `r`, after the test samples changed within `changed` (`r` is
+    /// `changed` expanded by the blur radius).
+    fn refresh_moments_and_maps(&mut self, s: usize, changed: Rect, r: Rect) {
         let (w, h) = self.dims(s);
         if r.is_empty() {
             return;
@@ -219,35 +344,46 @@ impl IncrementalState {
         let rw = r.x1 - r.x0;
         let n = rw * (r.y1 - r.y0);
         self.blur.set_width(rw);
-        let region = [r.x0..r.x1, r.y0..r.y1];
         for c in 0..3 {
             let active = active_maps(c, s, self.scales());
             if !active.contains(&true) {
                 continue;
             }
+            let planes = moment_planes(active);
             let rec = &self.xyb[s][c];
             let src = &self.reference.scales[s].xyb[c];
+            let cache = &mut self.filtered[s][c];
+            // Rows outside `changed` kept their samples, so their filtered
+            // columns stay valid; only the changed rows are refiltered.
+            cache.invalidate(changed.y0..changed.y1);
             let [mu2, s22, s12] = &mut self.moments;
-            if mu2.len() < n {
-                mu2.resize(n, 0.0);
-            }
-            if active[0] {
-                for buffer in [&mut *s22, &mut *s12] {
-                    if buffer.len() < n {
-                        buffer.resize(n, 0.0);
-                    }
+            for buffer in [&mut *mu2, &mut *s22, &mut *s12].into_iter().take(planes) {
+                if buffer.len() < n {
+                    buffer.resize(n, 0.0);
                 }
-                self.blur.blur_moments_region(
-                    [src, rec],
-                    w,
-                    h,
-                    region.clone(),
-                    [&mut mu2[..n], &mut s22[..n], &mut s12[..n]],
-                    rw,
-                );
-            } else {
+            }
+            let mut y = r.y0;
+            while y < r.y1 {
+                let count = VERTICAL_BATCH.min(r.y1 - y);
+                let first = y.saturating_sub(RADIUS);
+                let last = (y + count + RADIUS).min(h);
+                cache.fill(&mut self.blur, [src, rec], first..last, r.x0..r.x1);
+                // Window rows `y - RADIUS ..`; rows outside the plane read zeros.
+                let zero = &self.zero[r.x0..];
+                let mut rows = [zero; VERTICAL_BATCH + 2 * RADIUS];
+                let top = RADIUS - (y - first);
+                for (row, sy) in rows[top..].iter_mut().zip(first..last) {
+                    *row = &cache.row(sy)[r.x0..];
+                }
+                let at = (y - r.y0) * rw;
+                let out = [
+                    &mut mu2[at..],
+                    if planes == 3 { &mut s22[at..] } else { &mut [] },
+                    if planes == 3 { &mut s12[at..] } else { &mut [] },
+                ];
                 self.blur
-                    .blur_region(rec, w, h, region.clone(), &mut mu2[..n], rw);
+                    .vertical_rows(&rows[..count + 2 * RADIUS], w, planes, rw, out, rw);
+                y += count;
             }
             self.refresh_maps(s, c, r);
         }
@@ -404,7 +540,7 @@ impl IncrementalState {
                 );
             }
             // moments and maps depend on the test image within the blur radius
-            self.refresh_moments_and_maps(s, rs.expand(RADIUS, w, h));
+            self.refresh_moments_and_maps(s, rs, rs.expand(RADIUS, w, h));
         }
         Ok(())
     }
@@ -437,7 +573,6 @@ impl IncrementalState {
             return Err(Error::DimensionMismatch);
         }
         let cp = checkpoint;
-        cp.data.clear();
         cp.rect = None;
         let rect = rect.clamp(self.width(), self.height());
         if rect.is_empty() {
@@ -459,18 +594,23 @@ impl IncrementalState {
                 6 * pixels + maps * halo
             })
             .sum();
-        cp.data.reserve_exact(needed);
+        // Grow without zeroing on reuse: every saved sample is overwritten.
+        if cp.data.len() < needed {
+            cp.data.resize(needed, 0.0);
+        }
+        cp.data.truncate(needed);
+        let mut at = 0;
         for (s, (rs, region)) in self.update_rects(rect).enumerate() {
             let w = self.dims(s).0;
             for c in 0..3 {
-                save_rows(&self.lin[s][c], w, rs, &mut cp.data);
-                save_rows(&self.xyb[s][c], w, rs, &mut cp.data);
+                at = save_rows(&self.lin[s][c], w, rs, &mut cp.data, at);
+                at = save_rows(&self.xyb[s][c], w, rs, &mut cp.data, at);
                 for map in &self.maps[s][c] {
-                    save_rows(map, w, region, &mut cp.data);
+                    at = save_rows(map, w, region, &mut cp.data, at);
                 }
             }
         }
-        debug_assert_eq!(cp.data.len(), needed);
+        debug_assert_eq!(at, needed);
         let result = self.update(test, rect);
         if result.is_err() {
             cp.rect = None;
@@ -494,6 +634,8 @@ impl IncrementalState {
                 for m in 0..3 {
                     at = load_rows(&mut self.maps[s][c][m], w, region, &cp.data, at);
                 }
+                // The restored rows' filtered moments are stale; refilter on use.
+                self.filtered[s][c].invalidate(rs.y0..rs.y1);
             }
         }
         debug_assert_eq!(at, cp.data.len());

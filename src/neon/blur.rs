@@ -361,3 +361,71 @@ unsafe fn moment_vertical<const N: usize>(
     }
     done
 }
+
+/// # Safety
+/// NEON must be available. `rows[j]` points at the first output column of
+/// source row `j` of the window (zeros for rows outside the plane), and each
+/// is valid for `(planes - 1) · plane_stride + width` samples; plane `c`
+/// starts `c · plane_stride` samples after it. `out[c]` must be valid for
+/// `(rows.len() - 2·RADIUS - 1) · out_stride + width` samples, `width >= 4`.
+///
+/// Every output is the per-row kernels' expression (`center·k` plus the
+/// symmetric pairs in tap order, multiplies and adds unfused), so results
+/// match them bit for bit. Four output rows share fourteen row loads.
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn blur_vertical_region_neon(
+    rows: &[*const f32],
+    plane_stride: usize,
+    planes: usize,
+    width: usize,
+    k: &[f32; WINDOW],
+    out: [*mut f32; 3],
+    out_stride: usize,
+) {
+    debug_assert!(width >= 4 && rows.len() > 2 * RADIUS);
+    let outputs = rows.len() - 2 * RADIUS;
+    let coeff: [float32x4_t; RADIUS + 1] = std::array::from_fn(|i| vdupq_n_f32(k[i]));
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn tap(window: &[float32x4_t], coeff: &[float32x4_t; RADIUS + 1]) -> float32x4_t {
+        let mut acc = vmulq_f32(window[RADIUS], coeff[RADIUS]);
+        for i in 0..RADIUS {
+            acc = vaddq_f32(
+                acc,
+                vmulq_f32(vaddq_f32(window[i], window[WINDOW - 1 - i]), coeff[i]),
+            );
+        }
+        acc
+    }
+    for (c, &dst) in out.iter().enumerate().take(planes) {
+        let offset = c * plane_stride;
+        // Complete vectors, then one overlapping vector for a short tail.
+        let last = width - 4;
+        let mut x = 0;
+        loop {
+            let column = x.min(last);
+            let mut y = 0;
+            unsafe {
+                while y + 4 <= outputs {
+                    let window: [float32x4_t; WINDOW + 3] =
+                        std::array::from_fn(|j| vld1q_f32(rows[y + j].add(offset + column)));
+                    for o in 0..4 {
+                        let value = tap(&window[o..o + WINDOW], &coeff);
+                        vst1q_f32(dst.add((y + o) * out_stride + column), value);
+                    }
+                    y += 4;
+                }
+                while y < outputs {
+                    let window: [float32x4_t; WINDOW] =
+                        std::array::from_fn(|j| vld1q_f32(rows[y + j].add(offset + column)));
+                    vst1q_f32(dst.add(y * out_stride + column), tap(&window, &coeff));
+                    y += 1;
+                }
+            }
+            if column == last {
+                break;
+            }
+            x += 4;
+        }
+    }
+}

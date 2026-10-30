@@ -36,6 +36,7 @@ mod xyb;
 pub(crate) use blur::{
     blur_horizontal_avx2, blur_moment_horizontal_avx2, blur_moment_row_avx2,
     blur_moment_vertical_avx2, blur_product_row_avx2, blur_vertical_avx2,
+    blur_vertical_region_avx2,
 };
 pub(crate) use downsample::downsample_rows_avx2;
 pub(crate) use image::has_non_finite_avx2;

@@ -36,6 +36,7 @@ mod xyb;
 pub(crate) use blur::{
     blur_horizontal_neon, blur_moment_horizontal_neon, blur_moment_row_neon,
     blur_moment_vertical_neon, blur_product_row_neon, blur_vertical_neon,
+    blur_vertical_region_neon,
 };
 pub(crate) use downsample::downsample_rows_neon;
 pub(crate) use image::has_non_finite_neon;

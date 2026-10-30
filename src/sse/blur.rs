@@ -368,3 +368,75 @@ unsafe fn moment_vertical<const N: usize>(
     }
     done
 }
+
+/// # Safety
+/// The CPU feature must be available, `width >= 4`, and `rows.len() > 2 * RADIUS`.
+/// Each `rows[j]` is valid for `(planes - 1) * plane_stride + width` samples
+/// (plane `c` starts `c * plane_stride` after it) and each used `out[c]` for
+/// `(rows.len() - 2 * RADIUS - 1) * out_stride + width`.
+///
+/// Every output is the per-row kernels' expression (center, then the pairs
+/// in tap order, unfused), so results match them bit for bit.
+#[target_feature(enable = "sse4.1")]
+pub(crate) unsafe fn blur_vertical_region_sse41(
+    rows: &[*const f32],
+    plane_stride: usize,
+    planes: usize,
+    width: usize,
+    k: &[f32; WINDOW],
+    out: [*mut f32; 3],
+    out_stride: usize,
+) {
+    debug_assert!(width >= 4 && rows.len() > 2 * RADIUS);
+    let outputs = rows.len() - 2 * RADIUS;
+    unsafe {
+        let mut coeff = [_mm_set1_ps(0.0); RADIUS + 1];
+        for (c, &v) in coeff.iter_mut().zip(k) {
+            *c = _mm_set1_ps(v);
+        }
+        let tap = |window: &[__m128]| {
+            let mut acc = _mm_mul_ps(window[RADIUS], coeff[RADIUS]);
+            for i in 0..RADIUS {
+                acc = _mm_add_ps(
+                    acc,
+                    _mm_mul_ps(_mm_add_ps(window[i], window[WINDOW - 1 - i]), coeff[i]),
+                );
+            }
+            acc
+        };
+        for (c, &dst) in out.iter().enumerate().take(planes) {
+            // Complete vectors, then one overlapping vector for a short tail.
+            let last = width - 4;
+            let mut x = 0;
+            loop {
+                let column = x.min(last);
+                let mut y = 0;
+                while y + 4 <= outputs {
+                    let mut window = [_mm_set1_ps(0.0); WINDOW + 3];
+                    for (j, value) in window.iter_mut().enumerate() {
+                        *value = _mm_loadu_ps(rows[y + j].add(c * plane_stride + column));
+                    }
+                    for o in 0..4 {
+                        _mm_storeu_ps(
+                            dst.add((y + o) * out_stride + column),
+                            tap(&window[o..o + WINDOW]),
+                        );
+                    }
+                    y += 4;
+                }
+                while y < outputs {
+                    let mut window = [_mm_set1_ps(0.0); WINDOW];
+                    for (j, value) in window.iter_mut().enumerate() {
+                        *value = _mm_loadu_ps(rows[y + j].add(c * plane_stride + column));
+                    }
+                    _mm_storeu_ps(dst.add(y * out_stride + column), tap(&window));
+                    y += 1;
+                }
+                if column == last {
+                    break;
+                }
+                x += 4;
+            }
+        }
+    }
+}

@@ -32,6 +32,8 @@ use std::{ops::Range, sync::OnceLock};
 
 pub(crate) const WINDOW: usize = 11;
 pub(crate) const RADIUS: usize = WINDOW / 2;
+/// Most output rows one [`GaussianBlur::vertical_rows`] call takes.
+pub(crate) const VERTICAL_BATCH: usize = 32;
 pub(crate) type BlurRows<'a> = [&'a [f32]; WINDOW];
 /// Each row contains mean, square and cross-product planes consecutively.
 pub(crate) type MomentRows<'a> = [&'a [f32]; WINDOW];
@@ -43,6 +45,9 @@ type MomentHorizontalFn = fn([&[f32]; 3], &[f32; WINDOW], [&mut [f32]; 3]) -> us
 type MomentVerticalFn = fn(&MomentRows<'_>, usize, &[f32; WINDOW], [&mut [f32]; 3]) -> usize;
 type ProductFn = fn([&[f32]; 2], &mut [f32]) -> usize;
 type VerticalFn = fn(&BlurRows<'_>, &[f32; WINDOW], &mut [f32]) -> usize;
+/// Whole-region vertical pass from row pointers; see `blur_vertical_region_neon`.
+type VerticalRegionFn =
+    unsafe fn(&[*const f32], usize, usize, usize, &[f32; WINDOW], [*mut f32; 3], usize);
 
 #[derive(Clone, Copy)]
 pub(crate) struct Kernels {
@@ -52,6 +57,8 @@ pub(crate) struct Kernels {
     moment_row: MomentRowFn,
     moment_horizontal: MomentHorizontalFn,
     moment_vertical: MomentVerticalFn,
+    /// Optional region kernel for the cached vertical pass (≥ 4 columns).
+    vertical_region: Option<VerticalRegionFn>,
 }
 
 #[cfg(any(test, not(all(target_arch = "aarch64", feature = "neon"))))]
@@ -62,6 +69,7 @@ const SCALAR: Kernels = Kernels {
     moment_row: moment_row_scalar,
     moment_horizontal: moment_horizontal_scalar,
     moment_vertical: moment_vertical_scalar,
+    vertical_region: None,
 };
 
 pub(crate) fn selected_kernels() -> Kernels {
@@ -80,6 +88,7 @@ pub(crate) fn selected_kernels() -> Kernels {
                 moment_vertical: |s, w, k, d| unsafe {
                     crate::avx::blur_moment_vertical_avx2(s, w, k, d)
                 },
+                vertical_region: Some(crate::avx::blur_vertical_region_avx2),
             };
         }
         #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
@@ -95,6 +104,7 @@ pub(crate) fn selected_kernels() -> Kernels {
                 moment_vertical: |s, w, k, d| unsafe {
                     crate::sse::blur_moment_vertical_sse41(s, w, k, d)
                 },
+                vertical_region: Some(crate::sse::blur_vertical_region_sse41),
             };
         }
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -110,6 +120,7 @@ pub(crate) fn selected_kernels() -> Kernels {
                 moment_vertical: |s, w, k, d| unsafe {
                     crate::neon::blur_moment_vertical_neon(s, w, k, d)
                 },
+                vertical_region: Some(crate::neon::blur_vertical_region_neon),
             }
         }
         #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
@@ -383,6 +394,195 @@ impl GaussianBlur {
         }
     }
 
+    /// Horizontal pass of the test moments (`planes == 3`: mean, square and
+    /// reference cross-product; `planes == 1`: the mean only) of source row
+    /// `y` over `columns`, into `dst`: `planes` consecutive planes of
+    /// `src_width` samples, written at `columns`. Zero padding only.
+    ///
+    /// Every output is the same function of its source row as in
+    /// [`blur_moments_region`](Self::blur_moments_region), whatever columns
+    /// are filtered together, so filtered rows can be kept and extended.
+    pub(crate) fn horizontal_row(
+        &mut self,
+        [reference, test]: [&[f32]; 2],
+        src_width: usize,
+        y: usize,
+        columns: Range<usize>,
+        planes: usize,
+        dst: &mut [f32],
+    ) {
+        assert!(self.zero_pad);
+        assert!(planes == 1 || planes == 3);
+        assert!(columns.end <= src_width);
+        assert_eq!(dst.len(), planes * src_width);
+        let w = columns.len();
+        if w == 0 {
+            return;
+        }
+        let k = &self.kernel;
+        let first = columns.start.saturating_sub(RADIUS);
+        let last = (columns.end + RADIUS).min(src_width);
+        let left_pad = RADIUS.saturating_sub(columns.start);
+        let copied_end = left_pad + last - first;
+        let len = w + 2 * RADIUS;
+        let start = y * src_width;
+        // Scratch only grows: callers filter at most the region width.
+        if self.padded.len() < len {
+            self.padded.resize(len, 0.0);
+        }
+        if planes == 1 {
+            let padded = &mut self.padded[..len];
+            padded[..left_pad].fill(0.0);
+            padded[left_pad..copied_end].copy_from_slice(&test[start + first..start + last]);
+            padded[copied_end..].fill(0.0);
+            let dst = &mut dst[columns];
+            let done = (self.kernels.horizontal)(padded, k, dst);
+            horizontal_scalar(&padded[done..], k, &mut dst[done..]);
+            return;
+        }
+        for padded in &mut self.moment_padded {
+            if padded.len() < len {
+                padded.resize(len, 0.0);
+            }
+        }
+        let [square_padded, cross_padded] = &mut self.moment_padded;
+        let mut padded = [
+            &mut self.padded[..len],
+            &mut square_padded[..len],
+            &mut cross_padded[..len],
+        ];
+        let inputs = [
+            &reference[start + first..start + last],
+            &test[start + first..start + last],
+        ];
+        let done = (self.kernels.moment_row)(
+            inputs,
+            padded.each_mut().map(|p| &mut p[left_pad..copied_end]),
+        );
+        if done < last - first {
+            moment_row_scalar(
+                inputs.map(|p| &p[done..]),
+                padded
+                    .each_mut()
+                    .map(|p| &mut p[left_pad + done..copied_end]),
+            );
+        }
+        for p in padded.iter_mut() {
+            p[..left_pad].fill(0.0);
+            p[copied_end..].fill(0.0);
+        }
+        let (mean, products) = dst.split_at_mut(src_width);
+        let (square, cross) = products.split_at_mut(src_width);
+        let mut dst = [
+            &mut mean[columns.clone()],
+            &mut square[columns.clone()],
+            &mut cross[columns],
+        ];
+        let done = (self.kernels.moment_horizontal)(
+            padded.each_ref().map(|p| &p[..]),
+            k,
+            dst.each_mut().map(|p| &mut p[..]),
+        );
+        if done < w {
+            moment_horizontal_scalar(
+                padded.each_ref().map(|p| &p[done..]),
+                k,
+                dst.each_mut().map(|p| &mut p[done..]),
+            );
+        }
+    }
+
+    /// Vertical pass over horizontally filtered rows: `rows[j]` starts at the
+    /// first output column of window row `j` and holds `planes` planes
+    /// `plane_stride` apart. Writes `rows.len() - 2·RADIUS` output rows of
+    /// `width` samples per plane into `out`, `out_stride` apart.
+    pub(crate) fn vertical_rows(
+        &self,
+        rows: &[&[f32]],
+        plane_stride: usize,
+        planes: usize,
+        width: usize,
+        mut out: [&mut [f32]; 3],
+        out_stride: usize,
+    ) {
+        assert!(planes == 1 || planes == 3);
+        assert!(rows.len() > 2 * RADIUS && rows.len() <= VERTICAL_BATCH + 2 * RADIUS);
+        let outputs = rows.len() - 2 * RADIUS;
+        assert!(
+            rows.iter()
+                .all(|r| r.len() >= (planes - 1) * plane_stride + width)
+        );
+        assert!(out_stride >= width);
+        if width == 0 {
+            return;
+        }
+        assert!(
+            out[..planes]
+                .iter()
+                .all(|p| p.len() >= (outputs - 1) * out_stride + width)
+        );
+        let k = &self.kernel;
+        if let Some(region) = self.kernels.vertical_region
+            && width >= 4
+        {
+            let mut pointers = [std::ptr::null::<f32>(); VERTICAL_BATCH + 2 * RADIUS];
+            for (pointer, row) in pointers.iter_mut().zip(rows) {
+                *pointer = row.as_ptr();
+            }
+            let dst = std::array::from_fn(|c| {
+                if c < planes {
+                    out[c].as_mut_ptr()
+                } else {
+                    std::ptr::null_mut()
+                }
+            });
+            // SAFETY: each row holds `planes` planes of `width` samples at
+            // `plane_stride`, and each output these rows at `out_stride`
+            // (both asserted above).
+            unsafe {
+                region(
+                    &pointers[..rows.len()],
+                    plane_stride,
+                    planes,
+                    width,
+                    k,
+                    dst,
+                    out_stride,
+                );
+            }
+            return;
+        }
+        for y in 0..outputs {
+            let window: [&[f32]; WINDOW] = std::array::from_fn(|i| rows[y + i]);
+            let start = y * out_stride;
+            if planes == 1 {
+                let window = window.map(|row| &row[..width]);
+                let dst = &mut out[0][start..start + width];
+                let done = (self.kernels.vertical)(&window, k, dst);
+                if done < width {
+                    let tail = window.map(|row| &row[done..]);
+                    vertical_scalar(&tail, k, &mut dst[done..]);
+                }
+            } else {
+                let done = (self.kernels.moment_vertical)(
+                    &window,
+                    plane_stride,
+                    k,
+                    out.each_mut().map(|p| &mut p[start..start + width]),
+                );
+                if done < width {
+                    moment_vertical_tail(
+                        &window,
+                        plane_stride,
+                        k,
+                        out.each_mut().map(|p| &mut p[start..start + width]),
+                        done,
+                    );
+                }
+            }
+        }
+    }
+
     fn blur_region_impl<const PRODUCT: bool>(
         &mut self,
         [src, second]: [&[f32]; 2],
@@ -590,6 +790,7 @@ mod tests {
                     moment_vertical: |s, w, k, d| unsafe {
                         crate::neon::blur_moment_vertical_neon(s, w, k, d)
                     },
+                    vertical_region: Some(crate::neon::blur_vertical_region_neon),
                 },
             ));
         }
@@ -608,6 +809,7 @@ mod tests {
                     moment_vertical: |s, w, k, d| unsafe {
                         crate::avx::blur_moment_vertical_avx2(s, w, k, d)
                     },
+                    vertical_region: Some(crate::avx::blur_vertical_region_avx2),
                 },
             ));
         }
@@ -626,6 +828,7 @@ mod tests {
                     moment_vertical: |s, w, k, d| unsafe {
                         crate::sse::blur_moment_vertical_sse41(s, w, k, d)
                     },
+                    vertical_region: Some(crate::sse::blur_vertical_region_sse41),
                 },
             ));
         }
@@ -968,5 +1171,77 @@ mod tests {
         GaussianBlur::new(7).blur_product([&[], &[]], 0, &mut []);
         GaussianBlur::new(0).blur_moments([&[], &[]], 4, [&mut [], &mut [], &mut []]);
         GaussianBlur::new(7).blur_moments([&[], &[]], 0, [&mut [], &mut [], &mut []]);
+    }
+
+    #[test]
+    fn region_kernels_match_per_row_vertical_bit_exactly() {
+        const GUARD: f32 = -12345.0;
+        let k = *kernel();
+        for (name, kernels) in available_kernels() {
+            let Some(region) = kernels.vertical_region else {
+                continue;
+            };
+            for planes in [1, 3] {
+                for width in 4..=40 {
+                    for outputs in 1..=VERTICAL_BATCH {
+                        // Rows of `planes` planes, `width + 5` apart, at an
+                        // offset so plane strides differ from the width.
+                        let stride = width + 5;
+                        let count = outputs + 2 * RADIUS;
+                        let source: Vec<Vec<f32>> = (0..count)
+                            .map(|j| {
+                                (0..planes * stride + 3)
+                                    .map(|i| ((i * 31 + j * 17 + width) % 97) as f32 / 13.0 - 2.0)
+                                    .collect()
+                            })
+                            .collect();
+                        let rows: Vec<*const f32> =
+                            source.iter().map(|row| row[3..].as_ptr()).collect();
+                        let out_stride = width + 2;
+                        let len = (outputs - 1) * out_stride + width + 1;
+                        let mut actual: [Vec<f32>; 3] = std::array::from_fn(|_| vec![GUARD; len]);
+                        let dst = std::array::from_fn(|c| {
+                            if c < planes {
+                                actual[c].as_mut_ptr()
+                            } else {
+                                std::ptr::null_mut()
+                            }
+                        });
+                        // SAFETY: rows hold `planes` planes of `width` at
+                        // `stride`, outputs every row at `out_stride`; the
+                        // kernel came from CPU-checked dispatch.
+                        unsafe { region(&rows, stride, planes, width, &k, dst, out_stride) };
+                        let mut expected: [Vec<f32>; 3] = std::array::from_fn(|_| vec![GUARD; len]);
+                        for y in 0..outputs {
+                            let window: [&[f32]; WINDOW] =
+                                std::array::from_fn(|i| &source[y + i][3..]);
+                            let at = y * out_stride;
+                            if planes == 1 {
+                                vertical_scalar(
+                                    &window.map(|r| &r[..width]),
+                                    &k,
+                                    &mut expected[0][at..at + width],
+                                );
+                            } else {
+                                moment_vertical_tail(
+                                    &window,
+                                    stride,
+                                    &k,
+                                    expected.each_mut().map(|p| &mut p[at..at + width]),
+                                    0,
+                                );
+                            }
+                        }
+                        for c in 0..planes {
+                            assert_eq!(
+                                actual[c].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                expected[c].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                "{name} planes={planes} width={width} outputs={outputs} plane={c}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

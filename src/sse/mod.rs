@@ -35,7 +35,8 @@ mod xyb;
 
 pub(crate) use blur::{
     blur_horizontal_sse41, blur_moment_horizontal_sse41, blur_moment_row_sse41,
-    blur_moment_vertical_sse41, blur_product_row_sse41, blur_vertical_sse41,
+    blur_moment_vertical_sse41, blur_product_row_sse41, blur_vertical_region_sse41,
+    blur_vertical_sse41,
 };
 pub(crate) use downsample::downsample_rows_sse41;
 pub(crate) use image::has_non_finite_sse41;

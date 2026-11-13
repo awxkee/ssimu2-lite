@@ -426,19 +426,28 @@ impl GaussianBlur {
         let copied_end = left_pad + last - first;
         let len = w + 2 * RADIUS;
         let start = y * src_width;
+        if planes == 1 {
+            let source = &test[start + first..start + last];
+            let window = if source.len() == len {
+                source
+            } else {
+                if self.padded.len() < len {
+                    self.padded.resize(len, 0.0);
+                }
+                let padded = &mut self.padded[..len];
+                padded[..left_pad].fill(0.0);
+                padded[left_pad..copied_end].copy_from_slice(source);
+                padded[copied_end..].fill(0.0);
+                padded
+            };
+            let dst = &mut dst[columns];
+            let done = (self.kernels.horizontal)(window, k, dst);
+            horizontal_scalar(&window[done..], k, &mut dst[done..]);
+            return;
+        }
         // Scratch only grows: callers filter at most the region width.
         if self.padded.len() < len {
             self.padded.resize(len, 0.0);
-        }
-        if planes == 1 {
-            let padded = &mut self.padded[..len];
-            padded[..left_pad].fill(0.0);
-            padded[left_pad..copied_end].copy_from_slice(&test[start + first..start + last]);
-            padded[copied_end..].fill(0.0);
-            let dst = &mut dst[columns];
-            let done = (self.kernels.horizontal)(padded, k, dst);
-            horizontal_scalar(&padded[done..], k, &mut dst[done..]);
-            return;
         }
         for padded in &mut self.moment_padded {
             if padded.len() < len {

@@ -99,49 +99,57 @@ unsafe fn convert(input: [*const f32; 3], output: [*mut f32; 3]) {
     }
 }
 
-/// Converts every pixel, the tail through a padded vector, so that any
-/// pixel's result is independent of its position in the row.
+/// Converts two vectors per iteration. A final overlapping vector handles
+/// partial tails, with a padded vector for inputs shorter than one vector.
 ///
 /// # Safety
 /// The CPU features must be available and all six slices must have equal lengths.
 #[target_feature(enable = "avx2,fma")]
-pub(crate) unsafe fn xyb_rows_avx2(input: [&[f32]; 3], [x, y, out_b]: [&mut [f32]; 3]) -> usize {
-    let n = x.len();
-    let (x_vectors, x_tail) = x.as_chunks_mut::<8>();
-    let (y_vectors, y_tail) = y.as_chunks_mut::<8>();
-    let (b_vectors, b_tail) = out_b.as_chunks_mut::<8>();
-    let [r, g, b] = input.map(|p| p.as_chunks::<8>().0);
-    let inputs = r.iter().zip(g).zip(b);
-    let outputs = x_vectors.iter_mut().zip(y_vectors).zip(b_vectors);
-    for (((r, g), b), ((x, y), out_b)) in inputs.zip(outputs) {
-        // Fixed-size chunks hold a complete vector in every plane.
+pub(crate) unsafe fn xyb_rows_avx2(input: [&[f32]; 3], mut output: [&mut [f32]; 3]) -> usize {
+    const LANES: usize = 8;
+    const BLOCK: usize = 2 * LANES;
+    let n = output[0].len();
+    if n >= LANES {
+        let inputs = input.map(|p| p.as_ptr());
+        let outputs = output.each_mut().map(|p| p.as_mut_ptr());
+        let mut i = 0;
+        // SAFETY: all six slices have length n. The last call may rewrite
+        // earlier lanes, but every read and write stays inside its slice.
         unsafe {
-            convert(
-                [r.as_ptr(), g.as_ptr(), b.as_ptr()],
-                [x.as_mut_ptr(), y.as_mut_ptr(), out_b.as_mut_ptr()],
-            );
+            while n - i >= BLOCK {
+                convert(inputs.map(|p| p.add(i)), outputs.map(|p| p.add(i)));
+                convert(
+                    inputs.map(|p| p.add(i + LANES)),
+                    outputs.map(|p| p.add(i + LANES)),
+                );
+                i += BLOCK;
+            }
+            if n - i >= LANES {
+                convert(inputs.map(|p| p.add(i)), outputs.map(|p| p.add(i)));
+                i += LANES;
+            }
+            if i < n {
+                let last = n - LANES;
+                convert(inputs.map(|p| p.add(last)), outputs.map(|p| p.add(last)));
+            }
         }
-    }
-    let done = n - x_tail.len();
-    if done < n {
-        let tail = n - done;
-        let src: [[f32; 8]; 3] = std::array::from_fn(|c| {
-            let mut v = [0f32; 8];
-            v[..tail].copy_from_slice(&input[c][done..]);
+    } else if n != 0 {
+        let src: [[f32; LANES]; 3] = input.map(|p| {
+            let mut v = [0.0; LANES];
+            v[..n].copy_from_slice(p);
             v
         });
-        let mut dst = [[0f32; 8]; 3];
-        let [dx, dy, db] = &mut dst;
-        // Stack buffers hold one complete vector each.
+        let mut dst = [[0.0; LANES]; 3];
+        // SAFETY: each stack buffer holds a complete vector.
         unsafe {
             convert(
                 src.each_ref().map(|v| v.as_ptr()),
-                [dx.as_mut_ptr(), dy.as_mut_ptr(), db.as_mut_ptr()],
+                dst.each_mut().map(|v| v.as_mut_ptr()),
             );
         }
-        x_tail.copy_from_slice(&dst[0][..tail]);
-        y_tail.copy_from_slice(&dst[1][..tail]);
-        b_tail.copy_from_slice(&dst[2][..tail]);
+        for (plane, tail) in output.into_iter().zip(&dst) {
+            plane.copy_from_slice(&tail[..n]);
+        }
     }
     n
 }

@@ -38,7 +38,7 @@
 
 use crate::blur::GaussianBlur;
 use crate::dispatch::Kernels;
-use crate::maps::MapKind;
+use crate::maps::{MapKind, MapSums, SUM_LANES};
 use crate::{Error, RgbImage};
 use std::sync::{Arc, OnceLock};
 
@@ -180,15 +180,16 @@ fn pool(kernels: &Kernels, map: &[f32], w1: f64, w4: f64, acc: Option<&mut [f32]
     if w1 == 0.0 && w4 == 0.0 {
         return 0.0;
     }
-    let n = map.len() as f64;
-    let (s1, s4) = kernels.maps.map_sums(map);
-    let m1 = s1 / n;
-    let m4 = s4 / n;
-    let n4 = m4.sqrt().sqrt();
+    let (m1, n4) = map_norms(kernels.maps.map_sums(map), map.len());
     if let Some(acc) = acc {
         add_map_contribution(kernels.error_map, map, w1, w4, n4, acc);
     }
     w1 * m1 + w4 * n4
+}
+
+fn map_norms((first, fourth): (f64, f64), pixels: usize) -> (f64, f64) {
+    let n = pixels as f64;
+    (first / n, (fourth / n).sqrt().sqrt())
 }
 
 /// Compute the pixel contribution in f32. Normalizing by the fourth norm
@@ -436,19 +437,62 @@ pub(crate) fn ssim_value(m1: f32, m2: f32, v11: f32, v22: f32, v12: f32) -> f32 
 /// Signed edge ratio: positive is an artifact, negative is detail loss.
 #[inline(always)]
 pub(crate) fn edge_ratio(a: f32, b: f32, m1: f32, m2: f32) -> f32 {
-    (1.0 + (b - m2).abs()) / (1.0 + (a - m1).abs()) - 1.0
+    edge_ratio_with_denominator(edge_denominator(a, m1), b, m2)
+}
+
+#[inline(always)]
+pub(crate) fn edge_ratio_with_denominator(denominator: f32, b: f32, m2: f32) -> f32 {
+    (1.0 + (b - m2).abs()) / denominator - 1.0
+}
+
+#[inline(always)]
+pub(crate) fn edge_denominator(src: f32, mean: f32) -> f32 {
+    1.0 + (src - mean).abs()
 }
 
 /// One scale of an analysed reference.
 pub(crate) struct ReferenceScale {
     pub(crate) width: usize,
     pub(crate) height: usize,
-    /// Positive XYB planes.
-    pub(crate) xyb: [Vec<f32>; 3],
-    /// Blurred planes; empty for planes without weighted maps.
+    /// Positive XYB, or the reference edge denominator for artifact-only channels.
+    pub(crate) xyb_or_denominator: [Vec<f32>; 3],
+    /// Blurred planes. Empty for channels with precomputed denominators or no maps.
     pub(crate) mu: [Vec<f32>; 3],
     /// Blurred squares; empty unless the plane's SSIM map is weighted.
     pub(crate) sigma: [Vec<f32>; 3],
+}
+
+fn compute_edge_maps(
+    kernels: &crate::maps::Kernels,
+    src: &[f32],
+    rec: &[f32],
+    mu1: &[f32],
+    mu2: &[f32],
+    [artifact, detail]: [&mut [f32]; 2],
+    active: [bool; 3],
+) {
+    let (artifact_kind, edge_mean) = if mu1.is_empty() {
+        (MapKind::ArtifactWithDenominator, src)
+    } else {
+        (MapKind::Artifact, mu1)
+    };
+    let inputs = [src, rec, edge_mean, mu2, src];
+    if active[1] && active[2] {
+        kernels.compute_edge_maps(inputs, [artifact, detail]);
+    } else if active[1] {
+        kernels.compute_map(artifact_kind, inputs, artifact);
+    } else if active[2] {
+        kernels.compute_map(MapKind::Detail, inputs, detail);
+    }
+}
+
+fn downsample_linear(kernels: &Kernels, previous: &ReferenceScale, linear: &mut [Vec<f32>; 3]) {
+    for plane in linear {
+        *plane = kernels
+            .downsample
+            .downsample(plane, previous.width, previous.height)
+            .0;
+    }
 }
 
 pub(crate) struct ReferenceData {
@@ -487,15 +531,23 @@ impl PreparedReference {
                     *plane = kernels.downsample.downsample(plane, pw, ph).0;
                 }
             }
-            let xyb = kernels.xyb.positive_xyb_of_linear(&lin);
+            let mut xyb = kernels.xyb.positive_xyb_of_linear(&lin);
             blur.set_width(w);
             let mut mu: [Vec<f32>; 3] = Default::default();
             let mut sigma: [Vec<f32>; 3] = Default::default();
             for c in 0..3 {
                 let active = active_maps(c, scale, count);
-                if active.contains(&true) {
-                    mu[c] = vec![0.0; w * h];
-                    blur.blur(&xyb[c], h, &mut mu[c]);
+                if !active.contains(&true) {
+                    continue;
+                }
+                let mut mean = vec![0.0; w * h];
+                blur.blur(&xyb[c], h, &mut mean);
+                if active == [false, true, false] {
+                    for (value, mean) in xyb[c].iter_mut().zip(mean) {
+                        *value = edge_denominator(*value, mean);
+                    }
+                } else {
+                    mu[c] = mean;
                 }
                 if active[0] {
                     sigma[c] = vec![0.0; w * h];
@@ -505,7 +557,7 @@ impl PreparedReference {
             scales.push(ReferenceScale {
                 width: w,
                 height: h,
-                xyb,
+                xyb_or_denominator: xyb,
                 mu,
                 sigma,
             });
@@ -534,17 +586,123 @@ impl PreparedReference {
     /// SSIMULACRA 2 score of `test`: 100 is identical, lower is worse
     /// (about 90 is visually lossless, 70 high quality, 50 medium).
     pub fn compare(&self, test: RgbImage<'_>) -> Result<f64, Error> {
-        self.evaluate(test, false).map(|(score, _)| score)
+        // A multiple of eight keeps each non-final band aligned with the
+        // f64 pooling lanes, including when the image width is odd.
+        const BAND_ROWS: usize = 128;
+        const _: () = assert!(BAND_ROWS.is_multiple_of(SUM_LANES));
+        const _: () = assert!(BAND_ROWS >= 2 * RADIUS);
+        let d = &*self.data;
+        if (test.width(), test.height()) != (d.width, d.height) {
+            return Err(Error::DimensionMismatch);
+        }
+        let kernels = &d.kernels;
+        let mut lin = test.to_linear(kernels.image)?;
+        let mut blur = GaussianBlur::with_kernels(d.width, *kernel(), true, kernels.blur);
+        let mut scratch: [Vec<f32>; 4] =
+            std::array::from_fn(|_| vec![0.0; d.width * d.height.min(BAND_ROWS)]);
+        let mut xyb: [Vec<f32>; 3] =
+            std::array::from_fn(|_| vec![0.0; d.width * d.height.min(BAND_ROWS + 2 * RADIUS)]);
+        let mut sum = 0.0;
+        for (s, reference) in d.scales.iter().enumerate() {
+            let (w, h) = (reference.width, reference.height);
+            if s > 0 {
+                downsample_linear(kernels, &d.scales[s - 1], &mut lin);
+            }
+            blur.set_width(w);
+            let mut sums: [[MapSums; 3]; 3] = Default::default();
+            let active = std::array::from_fn::<_, 3, _>(|c| active_maps(c, s, d.scales.len()));
+            let mut previous_first = 0;
+            let mut converted_end = 0;
+            for y in (0..h).step_by(BAND_ROWS) {
+                let end = (y + BAND_ROWS).min(h);
+                // Keep the real image halo on either side of the band so the
+                // local blur pads with zeros only at the actual image edges.
+                let first = y.saturating_sub(RADIUS);
+                let last = (end + RADIUS).min(h);
+                let halo = first * w..last * w;
+                let reused = (converted_end - first) * w;
+                if reused > 0 {
+                    // Carry the already converted halo into the next band.
+                    let offset = (first - previous_first) * w;
+                    for plane in &mut xyb {
+                        plane.copy_within(offset..offset + reused, 0);
+                    }
+                }
+                let span = y * w..end * w;
+                let band_rows = y - first..end - first;
+                let band_pixels = band_rows.start * w..band_rows.end * w;
+                kernels.xyb.positive_xyb_into(
+                    lin.each_ref().map(|p| &p[converted_end * w..halo.end]),
+                    xyb.each_mut().map(|p| &mut p[reused..halo.len()]),
+                );
+                previous_first = first;
+                converted_end = last;
+                for (c, active) in active.iter().copied().enumerate() {
+                    if !active.contains(&true) {
+                        continue;
+                    }
+                    let src = &reference.xyb_or_denominator[c];
+                    let rec = &xyb[c][..halo.len()];
+                    let (mu1, s11) = (&reference.mu[c], &reference.sigma[c]);
+                    let sums = &mut sums[c];
+                    let [mu2, s22, s12, ssim] = scratch.each_mut().map(|p| &mut p[..span.len()]);
+                    if active[0] {
+                        blur.blur_moments_region(
+                            [&src[halo.clone()], rec],
+                            w,
+                            last - first,
+                            [0..w, band_rows.clone()],
+                            [mu2, s22, s12],
+                            w,
+                        );
+                        kernels.maps.compute_map(
+                            MapKind::Ssim,
+                            [&mu1[span.clone()], mu2, &s11[span.clone()], s22, s12],
+                            ssim,
+                        );
+                        kernels.maps.add_map_sums(ssim, &mut sums[0]);
+                    } else {
+                        blur.blur_region(rec, w, last - first, [0..w, band_rows.clone()], mu2, w);
+                    }
+                    let edge_mean = if mu1.is_empty() {
+                        &[]
+                    } else {
+                        &mu1[span.clone()]
+                    };
+                    compute_edge_maps(
+                        kernels.maps,
+                        &src[span.clone()],
+                        &rec[band_pixels.clone()],
+                        edge_mean,
+                        mu2,
+                        [s22, s12],
+                        active,
+                    );
+                    if active[1] {
+                        kernels.maps.add_map_sums(s22, &mut sums[1]);
+                    }
+                    if active[2] {
+                        kernels.maps.add_map_sums(s12, &mut sums[2]);
+                    }
+                }
+            }
+            for (c, channel) in sums.into_iter().enumerate() {
+                let base = weight_base(c, s, d.scales.len());
+                for (m, totals) in channel.into_iter().enumerate() {
+                    if active[c][m] {
+                        let (m1, n4) = map_norms(totals.total(), w * h);
+                        sum += WEIGHTS[base + m] * m1 + WEIGHTS[base + 3 + m] * n4;
+                    }
+                }
+            }
+        }
+        Ok(score_from_sum(sum))
     }
 
     /// The score and a row-major per-pixel error map: each pixel's share of
     /// `100 - score`, linearized at the current score. The map's mean is
     /// approximately `100 - score`, so sums over regions are comparable.
     pub fn compare_with_map(&self, test: RgbImage<'_>) -> Result<(f64, Vec<f32>), Error> {
-        self.evaluate(test, true)
-    }
-
-    fn evaluate(&self, test: RgbImage<'_>, want_map: bool) -> Result<(f64, Vec<f32>), Error> {
         let d = &*self.data;
         if (test.width(), test.height()) != (d.width, d.height) {
             return Err(Error::DimensionMismatch);
@@ -556,47 +714,31 @@ impl PreparedReference {
         let mut moments: [Vec<f32>; 3] = Default::default();
         let mut ssim = Vec::new();
         let mut acc = Vec::new();
-        let mut map = if want_map {
-            vec![0f32; w0 * h0]
-        } else {
-            Vec::new()
-        };
+        let mut map = vec![0f32; w0 * h0];
         let mut sum = 0f64;
         for (s, reference) in d.scales.iter().enumerate() {
             let (w, h) = (reference.width, reference.height);
             if s > 0 {
-                let previous = &d.scales[s - 1];
-                for plane in &mut lin {
-                    *plane = kernels
-                        .downsample
-                        .downsample(plane, previous.width, previous.height)
-                        .0;
-                }
+                downsample_linear(kernels, &d.scales[s - 1], &mut lin);
             }
             let xyb = kernels.xyb.positive_xyb_of_linear(&lin);
             blur.set_width(w);
             for buffer in &mut moments {
                 buffer.resize(w * h, 0.0);
             }
-            if want_map && s > 0 {
+            if s > 0 {
                 acc.clear();
                 acc.resize(w * h, 0.0);
             }
             // The finest scale already has the output's resolution. Accumulate
             // it directly, so the temporary accumulator starts at the next scale.
-            let mut scale_acc = if !want_map {
-                None
-            } else if s == 0 {
-                Some(&mut map[..])
-            } else {
-                Some(&mut acc[..])
-            };
+            let scale_acc = if s == 0 { &mut map[..] } else { &mut acc[..] };
             for c in 0..3 {
                 let active = active_maps(c, s, d.scales.len());
                 if !active.contains(&true) {
                     continue;
                 }
-                let (src, rec) = (&reference.xyb[c], &xyb[c]);
+                let (src, rec) = (&reference.xyb_or_denominator[c], &xyb[c]);
                 let (mu1, s11) = (&reference.mu[c], &reference.sigma[c]);
                 let [mu2, s22, s12] = &mut moments;
                 // The finest X/B scales only weight edge maps; the variance
@@ -616,47 +758,31 @@ impl PreparedReference {
                     &ssim,
                     WEIGHTS[base],
                     WEIGHTS[base + 3],
-                    scale_acc.as_deref_mut(),
+                    Some(&mut *scale_acc),
                 );
                 // Variance/covariance are no longer needed after SSIM. Reuse
                 // those planes for the edge maps instead of retaining more buffers.
                 let (artifact, detail) = (s22, s12);
-                let edge_inputs = [&src[..], &rec[..], &mu1[..], &mu2[..], &src[..]];
-                if active[1] && active[2] {
-                    kernels
-                        .maps
-                        .compute_edge_maps(edge_inputs, [artifact, detail]);
-                } else if active[1] {
-                    kernels
-                        .maps
-                        .compute_map(MapKind::Artifact, edge_inputs, artifact);
-                } else if active[2] {
-                    kernels
-                        .maps
-                        .compute_map(MapKind::Detail, edge_inputs, detail);
-                }
+                compute_edge_maps(kernels.maps, src, rec, mu1, mu2, [artifact, detail], active);
                 for (m, values) in [artifact, detail].into_iter().enumerate() {
-                    let acc = scale_acc.as_deref_mut();
                     sum += pool(
                         kernels,
                         values,
                         WEIGHTS[base + m + 1],
                         WEIGHTS[base + 3 + m + 1],
-                        acc,
+                        Some(&mut *scale_acc),
                     );
                 }
             }
-            if want_map && s > 0 {
+            if s > 0 {
                 kernels
                     .error_map
                     .accumulate_scale_map(&acc, w0, h0, s, &mut map);
             }
         }
-        if want_map {
-            let factor = deficit_slope(sum) as f32 * (w0 * h0) as f32;
-            for v in &mut map {
-                *v *= factor;
-            }
+        let factor = deficit_slope(sum) as f32 * (w0 * h0) as f32;
+        for v in &mut map {
+            *v *= factor;
         }
         Ok((score_from_sum(sum), map))
     }
@@ -665,6 +791,34 @@ impl PreparedReference {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn score_bands_match_full_map_pooling_bit_for_bit() {
+        for (w, h) in [(9, 8), (65, 127), (65, 128), (65, 129), (129, 387)] {
+            for gain in [0.01, 1.0, 1024.0] {
+                let reference: [Vec<f32>; 3] = std::array::from_fn(|c| {
+                    (0..w * h)
+                        .map(|i| gain * (((i * 37 + i / w * 11 + c * 71) % 1009) as f32 / 1009.0))
+                        .collect()
+                });
+                let candidate: [Vec<f32>; 3] = reference.each_ref().map(|plane| {
+                    plane
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| v + ((i * 19 % 17) as f32 - 8.0) * 0.001)
+                        .collect()
+                });
+                let reference =
+                    RgbImage::linear_rgb(reference.each_ref().map(Vec::as_slice), w, h, w).unwrap();
+                let candidate =
+                    RgbImage::linear_rgb(candidate.each_ref().map(Vec::as_slice), w, h, w).unwrap();
+                let prepared = PreparedReference::new(reference).unwrap();
+                let score = prepared.compare(candidate).unwrap();
+                let (with_map, _) = prepared.compare_with_map(candidate).unwrap();
+                assert_eq!(score.to_bits(), with_map.to_bits(), "{w}x{h}, gain {gain}");
+            }
+        }
+    }
 
     fn test_kernels() -> Vec<(&'static str, MapKernels, bool)> {
         let selected = map_kernels();

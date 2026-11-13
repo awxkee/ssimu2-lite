@@ -40,34 +40,45 @@ use crate::metric::MapContribution;
 /// SSE4.1 must be available and both slices must have equal lengths.
 #[target_feature(enable = "sse4.1")]
 pub(crate) fn ss2_contribution_sse41(map: &[f32], p: MapContribution, acc: &mut [f32]) -> usize {
+    debug_assert_eq!(map.len(), acc.len());
     if p.norm_weight == 0.0 {
-        contribution::<false>(map, p, acc)
+        let done = contribution::<4, false>(map, p, acc);
+        done + contribution::<1, false>(&map[done..], p, &mut acc[done..])
     } else {
-        contribution::<true>(map, p, acc)
+        let done = contribution::<4, true>(map, p, acc);
+        done + contribution::<1, true>(&map[done..], p, &mut acc[done..])
     }
 }
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn contribution<const FOURTH: bool>(map: &[f32], p: MapContribution, acc: &mut [f32]) -> usize {
+fn contribution<const N: usize, const FOURTH: bool>(
+    map: &[f32],
+    p: MapContribution,
+    acc: &mut [f32],
+) -> usize {
     let (map_vectors, _) = map.as_chunks::<4>();
     let (acc_vectors, _) = acc.as_chunks_mut::<4>();
-    let done = acc_vectors.len() * 4;
+    let (map_blocks, _) = map_vectors.as_chunks::<N>();
+    let (acc_blocks, _) = acc_vectors.as_chunks_mut::<N>();
+    let done = acc_blocks.len() * N * 4;
     let linear = _mm_set1_ps(p.linear);
     let inv_norm = _mm_set1_ps(p.inv_norm);
     let norm_weight = _mm_set1_ps(p.norm_weight);
-    for (map, acc) in map_vectors.iter().zip(acc_vectors) {
-        // The entry point's equal-length contract covers complete vectors.
-        unsafe {
-            let v = _mm_loadu_ps(map.as_ptr());
-            let old = _mm_loadu_ps(acc.as_ptr());
-            let mut value = _mm_mul_ps(v, linear);
-            if FOURTH {
-                let normalized = _mm_mul_ps(v, inv_norm);
-                let square = _mm_mul_ps(normalized, normalized);
-                value = _mm_add_ps(value, _mm_mul_ps(_mm_mul_ps(norm_weight, square), square));
+    for (map, acc) in map_blocks.iter().zip(acc_blocks) {
+        for (map, acc) in map.iter().zip(acc) {
+            // The entry point's equal-length contract covers complete vectors.
+            unsafe {
+                let v = _mm_loadu_ps(map.as_ptr());
+                let old = _mm_loadu_ps(acc.as_ptr());
+                let mut value = _mm_mul_ps(v, linear);
+                if FOURTH {
+                    let normalized = _mm_mul_ps(v, inv_norm);
+                    let square = _mm_mul_ps(normalized, normalized);
+                    value = _mm_add_ps(value, _mm_mul_ps(_mm_mul_ps(norm_weight, square), square));
+                }
+                _mm_storeu_ps(acc.as_mut_ptr(), _mm_add_ps(old, value));
             }
-            _mm_storeu_ps(acc.as_mut_ptr(), _mm_add_ps(old, value));
         }
     }
     done
@@ -125,6 +136,7 @@ pub(crate) unsafe fn ss2_expand_row_sse41<const STEP: usize>(
 /// # Safety
 /// SSE4.1 must be available; every input must match the output length.
 /// REPLACE accumulates deltas into the eight f64 lanes; FOURTH also updates x⁴.
+#[inline]
 #[target_feature(enable = "sse4.1")]
 pub(crate) fn ss2_map_sse41<const KIND: usize, const REPLACE: bool, const FOURTH: bool>(
     inputs: MapInputs<'_>,
@@ -181,9 +193,10 @@ pub(crate) fn ss2_map_sse41<const KIND: usize, const REPLACE: bool, const FOURTH
 unsafe fn map_value<const KIND: usize>(input: [*const f32; 5]) -> __m128 {
     // The caller provides a complete vector at each pointer.
     unsafe {
-        let [a, b, c, d] = [input[0], input[1], input[2], input[3]].map(|p| _mm_loadu_ps(p));
+        let [a, b, d] = [input[0], input[1], input[3]].map(|p| _mm_loadu_ps(p));
         let one = _mm_set1_ps(1.0);
         let value = if KIND == 0 {
+            let c = _mm_loadu_ps(input[2]);
             let e = _mm_loadu_ps(input[4]);
             let diff = _mm_sub_ps(a, b);
             let num_m = _mm_sub_ps(one, _mm_mul_ps(diff, diff));
@@ -201,9 +214,14 @@ unsafe fn map_value<const KIND: usize>(input: [*const f32; 5]) -> __m128 {
             _mm_sub_ps(one, _mm_div_ps(_mm_mul_ps(num_m, num_s), denom))
         } else {
             let num = _mm_add_ps(one, _mm_andnot_ps(_mm_set1_ps(-0.0), _mm_sub_ps(b, d)));
-            let denom = _mm_add_ps(one, _mm_andnot_ps(_mm_set1_ps(-0.0), _mm_sub_ps(a, c)));
+            let denom = if KIND == 3 {
+                a
+            } else {
+                let c = _mm_loadu_ps(input[2]);
+                _mm_add_ps(one, _mm_andnot_ps(_mm_set1_ps(-0.0), _mm_sub_ps(a, c)))
+            };
             let ratio = _mm_sub_ps(_mm_div_ps(num, denom), one);
-            if KIND == 1 {
+            if KIND == 1 || KIND == 3 {
                 ratio
             } else {
                 _mm_sub_ps(_mm_setzero_ps(), ratio)
@@ -271,6 +289,7 @@ pub(crate) unsafe fn ss2_sums_sse41(map: &[f32], sums: &mut MapSums) -> usize {
 /// # Safety
 /// SSE4.1 must be available and all input/output slices must have equal lengths.
 /// The signed edge ratio is computed once for both maps and their f64 deltas.
+#[inline]
 #[target_feature(enable = "sse4.1")]
 pub(crate) fn ss2_edges_sse41<
     const REPLACE: bool,

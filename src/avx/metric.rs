@@ -176,6 +176,7 @@ pub(crate) fn ss2_expand_row_avx2<const STEP: usize>(
 /// # Safety
 /// AVX2 must be available; every input must match the output length.
 /// REPLACE accumulates deltas into the eight f64 lanes; FOURTH also updates x⁴.
+#[inline]
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn ss2_map_avx2<const KIND: usize, const REPLACE: bool, const FOURTH: bool>(
     inputs: MapInputs<'_>,
@@ -220,9 +221,10 @@ pub(crate) unsafe fn ss2_map_avx2<const KIND: usize, const REPLACE: bool, const 
 fn map_value<const KIND: usize>(input: [*const f32; 5]) -> __m256 {
     // The caller provides a complete vector at each pointer.
     unsafe {
-        let [a, b, c, d] = [input[0], input[1], input[2], input[3]].map(|p| _mm256_loadu_ps(p));
+        let [a, b, d] = [input[0], input[1], input[3]].map(|p| _mm256_loadu_ps(p));
         let one = _mm256_set1_ps(1.0);
         let value = if KIND == 0 {
+            let c = _mm256_loadu_ps(input[2]);
             let e = _mm256_loadu_ps(input[4]);
             let diff = _mm256_sub_ps(a, b);
             let num_m = _mm256_sub_ps(one, _mm256_mul_ps(diff, diff));
@@ -243,12 +245,17 @@ fn map_value<const KIND: usize>(input: [*const f32; 5]) -> __m256 {
                 one,
                 _mm256_andnot_ps(_mm256_set1_ps(-0.0), _mm256_sub_ps(b, d)),
             );
-            let denom = _mm256_add_ps(
-                one,
-                _mm256_andnot_ps(_mm256_set1_ps(-0.0), _mm256_sub_ps(a, c)),
-            );
+            let denom = if KIND == 3 {
+                a
+            } else {
+                let c = _mm256_loadu_ps(input[2]);
+                _mm256_add_ps(
+                    one,
+                    _mm256_andnot_ps(_mm256_set1_ps(-0.0), _mm256_sub_ps(a, c)),
+                )
+            };
             let ratio = _mm256_sub_ps(_mm256_div_ps(num, denom), one);
-            if KIND == 1 {
+            if KIND == 1 || KIND == 3 {
                 ratio
             } else {
                 _mm256_sub_ps(_mm256_setzero_ps(), ratio)
@@ -320,6 +327,7 @@ pub(crate) unsafe fn ss2_sums_avx2(map: &[f32], sums: &mut MapSums) -> usize {
 /// # Safety
 /// AVX2 must be available and all input/output slices must have equal lengths.
 /// The signed edge ratio is computed once for both maps and their f64 deltas.
+#[inline]
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn ss2_edges_avx2<
     const REPLACE: bool,

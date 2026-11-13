@@ -30,13 +30,13 @@
 //! Region-incremental scoring for encoder loops that change one area of a
 //! test image at a time. The state keeps the test image's linear and XYB
 //! pyramids, every weighted map and the pooled sums. Blurred test moments use
-//! reusable region scratch. An update recomputes only the changed area
+//! scratch for one vertical batch. An update recomputes only the changed area
 //! (plus the blur halo) at every scale and adjusts the sums; the score
 //! then costs a few hundred flops.
 
 use crate::blur::{GaussianBlur, VERTICAL_BATCH};
 use crate::dispatch::Kernels;
-use crate::maps::MapKind;
+use crate::maps::{MapKind, MapRegion};
 use crate::metric::{
     PooledContribution, PreparedReference, RADIUS, ReferenceData, WEIGHTS, active_maps,
     deficit_slope, kernel, score_from_sum, weight_base,
@@ -239,7 +239,7 @@ pub struct IncrementalState {
     lin: Vec<[Vec<f32>; 3]>,
     /// Test image's positive XYB planes per scale.
     xyb: Vec<[Vec<f32>; 3]>,
-    /// Reused region-sized mean, square and cross-product scratch.
+    /// Reused mean, square and cross-product scratch for one vertical batch.
     moments: [Vec<f32>; 3],
     /// Horizontally filtered test moments per scale and plane for a band of
     /// rows: the mean, square and cross-product (only the mean when the plane
@@ -308,8 +308,7 @@ impl IncrementalState {
             let whole = Rect::new(0, 0, w, h);
             st.refresh_moments_and_maps(s, whole, whole);
         }
-        // Initialization covers whole scales; local updates should retain only
-        // the scratch they actually need, rather than these full-frame buffers.
+        // Let local updates size their scratch to the regions they process.
         st.moments = Default::default();
         Ok(st)
     }
@@ -342,7 +341,7 @@ impl IncrementalState {
             return;
         }
         let rw = r.x1 - r.x0;
-        let n = rw * (r.y1 - r.y0);
+        let batch_len = rw * VERTICAL_BATCH.min(r.y1 - r.y0);
         self.blur.set_width(rw);
         for c in 0..3 {
             let active = active_maps(c, s, self.scales());
@@ -350,16 +349,14 @@ impl IncrementalState {
                 continue;
             }
             let planes = moment_planes(active);
-            let rec = &self.xyb[s][c];
-            let src = &self.reference.scales[s].xyb[c];
-            let cache = &mut self.filtered[s][c];
+            let base = weight_base(c, s, self.scales());
+            let need_fourth = std::array::from_fn(|m| WEIGHTS[base + 3 + m] != 0.0);
             // Rows outside `changed` kept their samples, so their filtered
             // columns stay valid; only the changed rows are refiltered.
-            cache.invalidate(changed.y0..changed.y1);
-            let [mu2, s22, s12] = &mut self.moments;
-            for buffer in [&mut *mu2, &mut *s22, &mut *s12].into_iter().take(planes) {
-                if buffer.len() < n {
-                    buffer.resize(n, 0.0);
+            self.filtered[s][c].invalidate(changed.y0..changed.y1);
+            for buffer in &mut self.moments[..planes] {
+                if buffer.len() < batch_len {
+                    buffer.resize(batch_len, 0.0);
                 }
             }
             let mut y = r.y0;
@@ -367,6 +364,9 @@ impl IncrementalState {
                 let count = VERTICAL_BATCH.min(r.y1 - y);
                 let first = y.saturating_sub(RADIUS);
                 let last = (y + count + RADIUS).min(h);
+                let src = &self.reference.scales[s].xyb_or_denominator[c];
+                let rec = &self.xyb[s][c];
+                let cache = &mut self.filtered[s][c];
                 cache.fill(&mut self.blur, [src, rec], first..last, r.x0..r.x1);
                 // Window rows `y - RADIUS ..`; rows outside the plane read zeros.
                 let zero = &self.zero[r.x0..];
@@ -375,92 +375,112 @@ impl IncrementalState {
                 for (row, sy) in rows[top..].iter_mut().zip(first..last) {
                     *row = &cache.row(sy)[r.x0..];
                 }
-                let at = (y - r.y0) * rw;
+                let [mu2, s22, s12] = &mut self.moments;
                 let out = [
-                    &mut mu2[at..],
-                    if planes == 3 { &mut s22[at..] } else { &mut [] },
-                    if planes == 3 { &mut s12[at..] } else { &mut [] },
+                    &mut mu2[..],
+                    if planes == 3 { &mut s22[..] } else { &mut [] },
+                    if planes == 3 { &mut s12[..] } else { &mut [] },
                 ];
                 self.blur
                     .vertical_rows(&rows[..count + 2 * RADIUS], w, planes, rw, out, rw);
+                self.refresh_maps(
+                    s,
+                    c,
+                    Rect::new(r.x0, y, r.x1, y + count),
+                    active,
+                    need_fourth,
+                );
                 y += count;
             }
-            self.refresh_maps(s, c, r);
+            // Clear residual fourth-sum round-off after the channel's entire
+            // region is updated. Its first sum can temporarily be zero between batches.
+            for sums in &mut self.sums[s][c] {
+                if sums.0 == 0.0 {
+                    sums.1 = 0.0;
+                }
+            }
         }
     }
 
-    /// Recompute the weighted maps over `r` from their current moments.
-    fn refresh_maps(&mut self, s: usize, c: usize, r: Rect) {
+    /// Recompute the weighted maps for the batch stored in `self.moments`.
+    fn refresh_maps(
+        &mut self,
+        s: usize,
+        c: usize,
+        r: Rect,
+        active: [bool; 3],
+        need_fourth: [bool; 3],
+    ) {
         let (w, _) = self.dims(s);
         let reference = &self.reference.scales[s];
-        let active = active_maps(c, s, self.scales());
-        let base = weight_base(c, s, self.scales());
-        let need_fourth: [bool; 3] = std::array::from_fn(|m| WEIGHTS[base + 3 + m] != 0.0);
         let rec = &self.xyb[s][c];
-        let src = &reference.xyb[c];
+        let src = &reference.xyb_or_denominator[c];
         let mu1 = &reference.mu[c];
         let s11 = &reference.sigma[c];
         let [mu2, s22, s12] = &self.moments;
         let [ssim, artifact, detail] = &mut self.maps[s][c];
-        for y in r.y0..r.y1 {
-            let span = y * w + r.x0..y * w + r.x1;
-            let start = (y - r.y0) * (r.x1 - r.x0);
-            let scratch = start..start + r.x1 - r.x0;
-            if active[0] {
-                self.kernels.maps.replace_map(
-                    MapKind::Ssim,
-                    [
-                        &mu1[span.clone()],
-                        &mu2[scratch.clone()],
-                        &s11[span.clone()],
-                        &s22[scratch.clone()],
-                        &s12[scratch.clone()],
-                    ],
-                    &mut ssim[span.clone()],
-                    &mut self.sums[s][c][0],
-                    need_fourth[0],
-                );
-            }
-            let inputs = [
-                &src[span.clone()],
-                &rec[span.clone()],
-                &mu1[span.clone()],
-                &mu2[scratch.clone()],
-                &src[span.clone()],
-            ];
-            if active[1] && active[2] {
-                let [_, artifact_sum, detail_sum] = &mut self.sums[s][c];
-                self.kernels.maps.replace_edge_maps(
-                    inputs,
-                    [&mut artifact[span.clone()], &mut detail[span]],
-                    [artifact_sum, detail_sum],
-                    [need_fourth[1], need_fourth[2]],
-                );
-            } else if active[1] {
-                self.kernels.maps.replace_map(
-                    MapKind::Artifact,
-                    inputs,
-                    &mut artifact[span],
-                    &mut self.sums[s][c][1],
-                    need_fourth[1],
-                );
-            } else if active[2] {
-                self.kernels.maps.replace_map(
-                    MapKind::Detail,
-                    inputs,
-                    &mut detail[span],
-                    &mut self.sums[s][c][2],
-                    need_fourth[2],
-                );
-            }
+        let (artifact_kind, edge_mean) = if mu1.is_empty() {
+            (MapKind::ArtifactWithDenominator, src)
+        } else {
+            (MapKind::Artifact, mu1)
+        };
+        let width = r.x1 - r.x0;
+        let region = MapRegion {
+            width,
+            height: r.y1 - r.y0,
+            stride: w,
+        };
+        let start = r.y0 * w + r.x0;
+        let [ssim_sum, artifact_sum, detail_sum] = &mut self.sums[s][c];
+        if active[0] {
+            self.kernels.maps.replace_map_rows(
+                MapKind::Ssim,
+                region,
+                [
+                    (&mu1[start..], w),
+                    (mu2, width),
+                    (&s11[start..], w),
+                    (s22, width),
+                    (s12, width),
+                ],
+                &mut ssim[start..],
+                ssim_sum,
+                need_fourth[0],
+            );
         }
-        // Maps are nonnegative: an exact zero first sum implies a zero
-        // fourth sum. Clear residual round-off after a candidate revert;
-        // the fourth root would otherwise amplify it near a perfect match.
-        for sums in &mut self.sums[s][c] {
-            if sums.0 == 0.0 {
-                sums.1 = 0.0;
-            }
+        let inputs = [
+            (&src[start..], w),
+            (&rec[start..], w),
+            (&edge_mean[start..], w),
+            (mu2, width),
+            (&src[start..], w),
+        ];
+        if active[1] && active[2] {
+            self.kernels.maps.replace_edge_map_rows(
+                region,
+                inputs,
+                [&mut artifact[start..], &mut detail[start..]],
+                [artifact_sum, detail_sum],
+                [need_fourth[1], need_fourth[2]],
+            );
+        } else if active[1] {
+            self.kernels.maps.replace_map_rows(
+                artifact_kind,
+                region,
+                inputs,
+                &mut artifact[start..],
+                artifact_sum,
+                need_fourth[1],
+            );
+        } else if active[2] {
+            self.kernels.maps.replace_map_rows(
+                MapKind::Detail,
+                region,
+                inputs,
+                &mut detail[start..],
+                detail_sum,
+                need_fourth[2],
+            );
         }
     }
 
@@ -1099,7 +1119,7 @@ mod state_tests {
             state
                 .moments
                 .iter()
-                .all(|p| p.len() <= (32 + 2 * RADIUS).pow(2))
+                .all(|p| p.len() <= (32 + 2 * RADIUS) * VERTICAL_BATCH)
         );
         assert!(cp.data.capacity() < w * h);
         for r in [

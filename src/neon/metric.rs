@@ -157,6 +157,7 @@ pub(crate) fn ss2_expand_row_neon<const STEP: usize>(
 /// # Safety
 /// NEON must be available; every input must match the output length.
 /// REPLACE accumulates deltas into the eight f64 lanes; FOURTH also updates x⁴.
+#[inline]
 #[target_feature(enable = "neon")]
 pub(crate) fn ss2_map_neon<const KIND: usize, const REPLACE: bool, const FOURTH: bool>(
     inputs: MapInputs<'_>,
@@ -213,9 +214,10 @@ pub(crate) fn ss2_map_neon<const KIND: usize, const REPLACE: bool, const FOURTH:
 fn map_value<const KIND: usize>(input: [*const f32; 5]) -> float32x4_t {
     // The caller provides a complete vector at each pointer.
     unsafe {
-        let [a, b, c, d] = [input[0], input[1], input[2], input[3]].map(|p| vld1q_f32(p));
+        let [a, b, d] = [input[0], input[1], input[3]].map(|p| vld1q_f32(p));
         let one = vdupq_n_f32(1.0);
         let value = if KIND == 0 {
+            let c = vld1q_f32(input[2]);
             let e = vld1q_f32(input[4]);
             let diff = vsubq_f32(a, b);
             let num_m = vsubq_f32(one, vmulq_f32(diff, diff));
@@ -230,12 +232,17 @@ fn map_value<const KIND: usize>(input: [*const f32; 5]) -> float32x4_t {
             vsubq_f32(one, vdivq_f32(vmulq_f32(num_m, num_s), denom))
         } else {
             let num = vaddq_f32(one, vabsq_f32(vsubq_f32(b, d)));
-            let denom = vaddq_f32(one, vabsq_f32(vsubq_f32(a, c)));
-            let ratio = vsubq_f32(vdivq_f32(num, denom), one);
-            if KIND == 1 {
-                ratio
+            let denom = if KIND == 3 {
+                a
             } else {
+                let c = vld1q_f32(input[2]);
+                vaddq_f32(one, vabsq_f32(vsubq_f32(a, c)))
+            };
+            let ratio = vsubq_f32(vdivq_f32(num, denom), one);
+            if KIND == 2 {
                 vsubq_f32(vdupq_n_f32(0.0), ratio)
+            } else {
+                ratio
             }
         };
         vmaxnmq_f32(value, vdupq_n_f32(0.0))
@@ -300,6 +307,7 @@ pub(crate) fn ss2_sums_neon(map: &[f32], sums: &mut MapSums) -> usize {
 /// # Safety
 /// NEON must be available and all input/output slices must have equal lengths.
 /// The signed edge ratio is computed once for both maps and their f64 deltas.
+#[inline]
 #[target_feature(enable = "neon")]
 pub(crate) fn ss2_edges_neon<
     const REPLACE: bool,

@@ -382,6 +382,9 @@ pub(crate) unsafe fn blur_vertical_region_avx2(
 ) {
     debug_assert!(width >= 4 && rows.len() > 2 * RADIUS);
     let outputs = rows.len() - 2 * RADIUS;
+    // SAFETY: y + 4 <= outputs implies y + WINDOW + 3 <= rows.len(),
+    // and y < outputs implies y + WINDOW <= rows.len(). Each column leaves
+    // a full vector for every load and store at the selected SIMD width.
     unsafe {
         if width >= 8 {
             let mut coeff = [_mm256_set1_ps(0.0); RADIUS + 1];
@@ -408,7 +411,9 @@ pub(crate) unsafe fn blur_vertical_region_avx2(
                     while y + 4 <= outputs {
                         let mut window = [_mm256_set1_ps(0.0); WINDOW + 3];
                         for (j, value) in window.iter_mut().enumerate() {
-                            *value = _mm256_loadu_ps(rows[y + j].add(c * plane_stride + column));
+                            *value = _mm256_loadu_ps(
+                                rows.get_unchecked(y + j).add(c * plane_stride + column),
+                            );
                         }
                         for o in 0..4 {
                             _mm256_storeu_ps(
@@ -421,7 +426,9 @@ pub(crate) unsafe fn blur_vertical_region_avx2(
                     while y < outputs {
                         let mut window = [_mm256_set1_ps(0.0); WINDOW];
                         for (j, value) in window.iter_mut().enumerate() {
-                            *value = _mm256_loadu_ps(rows[y + j].add(c * plane_stride + column));
+                            *value = _mm256_loadu_ps(
+                                rows.get_unchecked(y + j).add(c * plane_stride + column),
+                            );
                         }
                         _mm256_storeu_ps(dst.add(y * out_stride + column), tap(&window));
                         y += 1;
@@ -458,7 +465,9 @@ pub(crate) unsafe fn blur_vertical_region_avx2(
                     while y + 4 <= outputs {
                         let mut window = [_mm_set1_ps(0.0); WINDOW + 3];
                         for (j, value) in window.iter_mut().enumerate() {
-                            *value = _mm_loadu_ps(rows[y + j].add(c * plane_stride + column));
+                            *value = _mm_loadu_ps(
+                                rows.get_unchecked(y + j).add(c * plane_stride + column),
+                            );
                         }
                         for o in 0..4 {
                             _mm_storeu_ps(
@@ -471,7 +480,9 @@ pub(crate) unsafe fn blur_vertical_region_avx2(
                     while y < outputs {
                         let mut window = [_mm_set1_ps(0.0); WINDOW];
                         for (j, value) in window.iter_mut().enumerate() {
-                            *value = _mm_loadu_ps(rows[y + j].add(c * plane_stride + column));
+                            *value = _mm_loadu_ps(
+                                rows.get_unchecked(y + j).add(c * plane_stride + column),
+                            );
                         }
                         _mm_storeu_ps(dst.add(y * out_stride + column), tap(&window));
                         y += 1;

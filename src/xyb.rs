@@ -174,6 +174,41 @@ mod tests {
     }
 
     #[test]
+    fn xyb_vector_tails_are_independent_of_row_boundaries() {
+        let kernels = Kernels::new();
+        let input: [Vec<f32>; 3] = std::array::from_fn(|c| {
+            (0..64)
+                .map(|i| ((i * 31 + c * 17) % 257) as f32 / 91.0 - 0.5)
+                .collect()
+        });
+        let full = kernels.positive_xyb_of_linear(&input);
+        for offset in [0, 1, 3, 7] {
+            for n in 0..=33 {
+                let span = offset..offset + n;
+                let mut output = [
+                    vec![f32::NAN; n + 2],
+                    vec![f32::NAN; n + 2],
+                    vec![f32::NAN; n + 2],
+                ];
+                kernels.positive_xyb_into(
+                    input.each_ref().map(|p| &p[span.clone()]),
+                    output.each_mut().map(|p| &mut p[1..n + 1]),
+                );
+                for (plane, expected) in output.iter().zip(&full) {
+                    assert!(plane[0].is_nan() && plane[n + 1].is_nan());
+                    assert!(
+                        plane[1..n + 1]
+                            .iter()
+                            .zip(&expected[span.clone()])
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "offset={offset}, length={n}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cube_root_is_accurate() {
         for i in 1..2000 {
             let x = i as f32 * 0.0007;

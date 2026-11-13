@@ -98,35 +98,39 @@ unsafe fn convert(input: [*const f32; 3], output: [*mut f32; 3]) {
     }
 }
 
-/// Converts every pixel, the tail through a padded vector, so that any
-/// pixel's result is independent of its position in the row.
+/// Converts every pixel with the same vector arithmetic. The tail uses an
+/// overlapping vector when it fits or a padded vector for very short rows.
 ///
 /// # Safety
 /// The CPU features must be available and all six slices must have equal lengths.
 #[target_feature(enable = "sse4.1")]
 pub(crate) unsafe fn xyb_rows_sse41(input: [&[f32]; 3], [x, y, out_b]: [&mut [f32]; 3]) -> usize {
     let n = x.len();
-    let (x_vectors, x_tail) = x.as_chunks_mut::<4>();
-    let (y_vectors, y_tail) = y.as_chunks_mut::<4>();
-    let (b_vectors, b_tail) = out_b.as_chunks_mut::<4>();
-    let [r, g, b] = input.map(|p| p.as_chunks::<4>().0);
-    let inputs = r.iter().zip(g).zip(b);
-    let outputs = x_vectors.iter_mut().zip(y_vectors).zip(b_vectors);
-    for (((r, g), b), ((x, y), out_b)) in inputs.zip(outputs) {
-        // Fixed-size chunks hold a complete vector in every plane.
+    if n >= 4 {
+        let inputs = input.map(|p| p.as_ptr());
+        let outputs = [x.as_mut_ptr(), y.as_mut_ptr(), out_b.as_mut_ptr()];
+        let mut i = 0;
+        // Each iteration covers two complete vectors. The last one or two
+        // calls also stay within the row, rewriting a few lanes if needed.
         unsafe {
-            convert(
-                [r.as_ptr(), g.as_ptr(), b.as_ptr()],
-                [x.as_mut_ptr(), y.as_mut_ptr(), out_b.as_mut_ptr()],
-            );
+            while n - i >= 8 {
+                convert(inputs.map(|p| p.add(i)), outputs.map(|p| p.add(i)));
+                convert(inputs.map(|p| p.add(i + 4)), outputs.map(|p| p.add(i + 4)));
+                i += 8;
+            }
+            if n - i >= 4 {
+                convert(inputs.map(|p| p.add(i)), outputs.map(|p| p.add(i)));
+                i += 4;
+            }
+            if i < n {
+                let last = n - 4;
+                convert(inputs.map(|p| p.add(last)), outputs.map(|p| p.add(last)));
+            }
         }
-    }
-    let done = n - x_tail.len();
-    if done < n {
-        let tail = n - done;
+    } else if n > 0 {
         let src: [[f32; 4]; 3] = std::array::from_fn(|c| {
             let mut v = [0f32; 4];
-            v[..tail].copy_from_slice(&input[c][done..]);
+            v[..n].copy_from_slice(input[c]);
             v
         });
         let mut dst = [[0f32; 4]; 3];
@@ -138,9 +142,9 @@ pub(crate) unsafe fn xyb_rows_sse41(input: [&[f32]; 3], [x, y, out_b]: [&mut [f3
                 [dx.as_mut_ptr(), dy.as_mut_ptr(), db.as_mut_ptr()],
             );
         }
-        x_tail.copy_from_slice(&dst[0][..tail]);
-        y_tail.copy_from_slice(&dst[1][..tail]);
-        b_tail.copy_from_slice(&dst[2][..tail]);
+        x.copy_from_slice(&dst[0][..n]);
+        y.copy_from_slice(&dst[1][..n]);
+        out_b.copy_from_slice(&dst[2][..n]);
     }
     n
 }

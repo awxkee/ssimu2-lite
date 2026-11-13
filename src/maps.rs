@@ -28,7 +28,7 @@
  */
 
 //! SIMD map evaluation and f64 pooling, shared by full and incremental scores.
-use crate::metric::{edge_ratio, ssim_value};
+use crate::metric::{edge_ratio, edge_ratio_with_denominator, ssim_value};
 use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug)]
@@ -37,11 +37,60 @@ pub(crate) enum MapKind {
     Ssim,
     Artifact,
     Detail,
+    ArtifactWithDenominator,
 }
 
 // SSIM: mu1, mu2, s11, s22, s12. Edges: src, rec, mu1, mu2, unused.
+// With a precomputed denominator, input 0 is the denominator and input 2 is unused.
 pub(crate) type MapInputs<'a> = [&'a [f32]; 5];
+pub(crate) type StridedMapInputs<'a> = [(&'a [f32], usize); 5];
 pub(crate) const SUM_LANES: usize = 8;
+
+/// A rectangular band starting at the first pixel of each supplied slice.
+#[derive(Clone, Copy)]
+pub(crate) struct MapRegion {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) stride: usize,
+}
+
+impl MapRegion {
+    fn validate(self, inputs: StridedMapInputs<'_>, outputs: &[usize]) {
+        let required = |stride: usize| {
+            assert!(stride >= self.width);
+            (self.height - 1)
+                .checked_mul(stride)
+                .and_then(|offset| offset.checked_add(self.width))
+                .expect("map region size overflow")
+        };
+        assert!(self.width > 0 && self.height > 0);
+        assert!(
+            inputs
+                .iter()
+                .all(|&(input, stride)| input.len() >= required(stride))
+        );
+        let output_len = required(self.stride);
+        assert!(outputs.iter().all(|&len| len >= output_len));
+    }
+
+    /// All input spans must have been validated and `row < height`.
+    #[inline(always)]
+    unsafe fn input_row(self, inputs: StridedMapInputs<'_>, row: usize) -> MapInputs<'_> {
+        inputs.map(|(plane, stride)| {
+            let start = row * stride;
+            // SAFETY: validation checked the last row and earlier rows use smaller offsets.
+            unsafe { plane.get_unchecked(start..start + self.width) }
+        })
+    }
+
+    /// The output span must have been validated and `row < height`.
+    #[inline(always)]
+    unsafe fn output_row(self, output: &mut [f32], row: usize) -> &mut [f32] {
+        let start = row * self.stride;
+        // SAFETY: validation checked the last row and earlier rows use smaller offsets.
+        unsafe { output.get_unchecked_mut(start..start + self.width) }
+    }
+}
 
 /// Keep the same eight independent f64 lanes on every backend, including tails.
 /// Fourth powers must be formed in f64: finite HDR f32 maps can overflow in f32.
@@ -68,7 +117,7 @@ impl MapSums {
         }
     }
 
-    fn total(self) -> (f64, f64) {
+    pub(crate) fn total(self) -> (f64, f64) {
         (self.first.iter().sum(), self.fourth.iter().sum())
     }
 }
@@ -76,25 +125,87 @@ impl MapSums {
 type MapFn = unsafe fn(MapInputs<'_>, &mut [f32], &mut MapSums) -> usize;
 type EdgesFn = unsafe fn(MapInputs<'_>, [&mut [f32]; 2], &mut [MapSums; 2]) -> usize;
 type SumsFn = unsafe fn(&[f32], &mut MapSums) -> usize;
+type ReplaceMapFn = unsafe fn(MapRegion, StridedMapInputs<'_>, &mut [f32], &mut (f64, f64));
+type ReplaceEdgesFn =
+    unsafe fn(MapRegion, StridedMapInputs<'_>, [&mut [f32]; 2], [&mut (f64, f64); 2]);
 
 #[derive(Clone, Copy)]
 pub(crate) struct Kernels {
-    compute: [MapFn; 3],
-    replace: [[MapFn; 2]; 3],
+    compute: [MapFn; 4],
+    replace: [[ReplaceMapFn; 2]; 4],
     sums: SumsFn,
     edges: EdgesFn,
-    replace_edges: [EdgesFn; 4],
+    replace_edges: [ReplaceEdgesFn; 4],
+    #[cfg(test)]
+    replace_row: [[MapFn; 2]; 4],
+    #[cfg(test)]
+    replace_edges_row: [EdgesFn; 4],
 }
 
 macro_rules! kernels {
-    ($module:ident, $map:ident, $sums:ident, $edges:ident) => {
+    ($(#[$feature:meta])* $module:ident, $map:ident, $sums:ident, $edges:ident) => {{
+        $(#[$feature])*
+        #[allow(unused_unsafe)] // The AVX2 row kernel has an unsafe signature.
+        unsafe fn map_rows<const KIND: usize, const FOURTH: bool>(
+            region: MapRegion,
+            inputs: StridedMapInputs<'_>,
+            output: &mut [f32],
+            sums: &mut (f64, f64),
+        ) {
+            for row in 0..region.height {
+                // SAFETY: the dispatcher validated all spans and CPU features.
+                let (inputs, output) = unsafe { (region.input_row(inputs, row), region.output_row(output, row)) };
+                // Reset and reduce the same eight lanes for each row, in row order.
+                let mut delta = MapSums::default();
+                // SAFETY: the row slices have the validated width and the target feature is available.
+                let done = unsafe { crate::$module::$map::<KIND, true, FOURTH>(inputs, output, &mut delta) };
+                if done < region.width {
+                    map_tail_kind::<KIND, true, FOURTH>(inputs, output, &mut delta, done);
+                }
+                add_row_delta::<FOURTH>(sums, delta);
+            }
+        }
+
+        $(#[$feature])*
+        #[allow(unused_unsafe)] // The AVX2 row kernel has an unsafe signature.
+        unsafe fn edge_rows<const AF: bool, const DF: bool>(
+            region: MapRegion,
+            inputs: StridedMapInputs<'_>,
+            [artifact, detail]: [&mut [f32]; 2],
+            [artifact_sum, detail_sum]: [&mut (f64, f64); 2],
+        ) {
+            for row in 0..region.height {
+                // SAFETY: the dispatcher validated all spans and CPU features.
+                let (inputs, a, d) = unsafe {
+                    (region.input_row(inputs, row), region.output_row(artifact, row), region.output_row(detail, row))
+                };
+                let mut delta = [MapSums::default(), MapSums::default()];
+                // SAFETY: the row slices have the validated width and the target feature is available.
+                let done = unsafe { crate::$module::$edges::<true, AF, DF>(inputs, [a, d], &mut delta) };
+                if done < region.width {
+                    edges_tail::<true, AF, DF>(inputs, [a, d], &mut delta, done);
+                }
+                let [a_delta, d_delta] = delta;
+                add_row_delta::<AF>(artifact_sum, a_delta);
+                add_row_delta::<DF>(detail_sum, d_delta);
+            }
+        }
+
         Kernels {
             compute: [
                 crate::$module::$map::<0, false, false>,
                 crate::$module::$map::<1, false, false>,
                 crate::$module::$map::<2, false, false>,
+                crate::$module::$map::<3, false, false>,
             ],
             replace: [
+                [map_rows::<0, false>, map_rows::<0, true>],
+                [map_rows::<1, false>, map_rows::<1, true>],
+                [map_rows::<2, false>, map_rows::<2, true>],
+                [map_rows::<3, false>, map_rows::<3, true>],
+            ],
+            #[cfg(test)]
+            replace_row: [
                 [
                     crate::$module::$map::<0, true, false>,
                     crate::$module::$map::<0, true, true>,
@@ -107,17 +218,37 @@ macro_rules! kernels {
                     crate::$module::$map::<2, true, false>,
                     crate::$module::$map::<2, true, true>,
                 ],
+                [
+                    crate::$module::$map::<3, true, false>,
+                    crate::$module::$map::<3, true, true>,
+                ],
             ],
             sums: crate::$module::$sums,
             edges: crate::$module::$edges::<false, false, false>,
             replace_edges: [
+                edge_rows::<false, false>,
+                edge_rows::<true, false>,
+                edge_rows::<false, true>,
+                edge_rows::<true, true>,
+            ],
+            #[cfg(test)]
+            replace_edges_row: [
                 crate::$module::$edges::<true, false, false>,
                 crate::$module::$edges::<true, true, false>,
                 crate::$module::$edges::<true, false, true>,
                 crate::$module::$edges::<true, true, true>,
             ],
         }
-    };
+    }};
+}
+
+#[inline(always)]
+fn add_row_delta<const FOURTH: bool>(sums: &mut (f64, f64), delta: MapSums) {
+    let (first, fourth) = delta.total();
+    sums.0 += first;
+    if FOURTH {
+        sums.1 += fourth;
+    }
 }
 
 #[cfg(any(test, not(all(target_arch = "aarch64", feature = "neon"))))]
@@ -128,15 +259,33 @@ pub(crate) fn selected_kernels() -> &'static Kernels {
     KERNELS.get_or_init(|| {
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         if std::is_x86_feature_detected!("avx2") {
-            return kernels!(avx, ss2_map_avx2, ss2_sums_avx2, ss2_edges_avx2);
+            return kernels!(
+                #[target_feature(enable = "avx2")]
+                avx,
+                ss2_map_avx2,
+                ss2_sums_avx2,
+                ss2_edges_avx2
+            );
         }
         #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
         if std::is_x86_feature_detected!("sse4.1") {
-            return kernels!(sse, ss2_map_sse41, ss2_sums_sse41, ss2_edges_sse41);
+            return kernels!(
+                #[target_feature(enable = "sse4.1")]
+                sse,
+                ss2_map_sse41,
+                ss2_sums_sse41,
+                ss2_edges_sse41
+            );
         }
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
         {
-            kernels!(neon, ss2_map_neon, ss2_sums_neon, ss2_edges_neon)
+            kernels!(
+                #[target_feature(enable = "neon")]
+                neon,
+                ss2_map_neon,
+                ss2_sums_neon,
+                ss2_edges_neon
+            )
         }
         #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
         SCALAR
@@ -149,6 +298,7 @@ fn value(kind: usize, [a, b, c, d, e]: [f32; 5]) -> f32 {
         0 => ssim_value(a, b, c, d, e),
         1 => edge_ratio(a, b, c, d).max(0.0),
         2 => (-edge_ratio(a, b, c, d)).max(0.0),
+        3 => edge_ratio_with_denominator(a, b, d).max(0.0),
         _ => unreachable!(),
     }
 }
@@ -174,6 +324,7 @@ fn map_tail<const REPLACE: bool, const FOURTH: bool>(
         0 => map_tail_kind::<0, REPLACE, FOURTH>(inputs, map, sums, start),
         1 => map_tail_kind::<1, REPLACE, FOURTH>(inputs, map, sums, start),
         2 => map_tail_kind::<2, REPLACE, FOURTH>(inputs, map, sums, start),
+        3 => map_tail_kind::<3, REPLACE, FOURTH>(inputs, map, sums, start),
         _ => unreachable!(),
     }
 }
@@ -204,12 +355,17 @@ fn sums_scalar(map: &[f32], sums: &mut MapSums) -> usize {
 impl Kernels {
     pub(crate) fn map_sums(&self, map: &[f32]) -> (f64, f64) {
         let mut sums = MapSums::default();
+        self.add_map_sums(map, &mut sums);
+        sums.total()
+    }
+
+    /// Continue pooling at the start of a group of eight lanes.
+    pub(crate) fn add_map_sums(&self, map: &[f32], sums: &mut MapSums) {
         // SAFETY: dispatch checked CPU features; kernels read complete vectors.
-        let done = unsafe { (self.sums)(map, &mut sums) };
+        let done = unsafe { (self.sums)(map, sums) };
         for (i, &v) in map.iter().enumerate().skip(done) {
             sums.add::<false, true>(i, v, 0.0);
         }
-        sums.total()
     }
 
     pub(crate) fn compute_map(&self, kind: MapKind, inputs: MapInputs<'_>, map: &mut [f32]) {
@@ -220,29 +376,18 @@ impl Kernels {
         map_tail::<false, false>(kind as usize, inputs, map, &mut unused, done);
     }
 
-    pub(crate) fn replace_map(
+    pub(crate) fn replace_map_rows(
         &self,
         kind: MapKind,
-        inputs: MapInputs<'_>,
+        region: MapRegion,
+        inputs: StridedMapInputs<'_>,
         map: &mut [f32],
         sums: &mut (f64, f64),
         fourth: bool,
     ) {
-        assert!(inputs.iter().all(|p| p.len() == map.len()));
-        let mut delta = MapSums::default();
-        // SAFETY: dispatch checked CPU features and every input matches the output.
-        let done =
-            unsafe { self.replace[kind as usize][usize::from(fourth)](inputs, map, &mut delta) };
-        if fourth {
-            map_tail::<true, true>(kind as usize, inputs, map, &mut delta, done);
-        } else {
-            map_tail::<true, false>(kind as usize, inputs, map, &mut delta, done);
-        }
-        let delta = delta.total();
-        sums.0 += delta.0;
-        if fourth {
-            sums.1 += delta.1;
-        }
+        region.validate(inputs, &[map.len()]);
+        // SAFETY: dispatch checked CPU features and validation covered every row.
+        unsafe { self.replace[kind as usize][usize::from(fourth)](region, inputs, map, sums) };
     }
 }
 
@@ -291,41 +436,18 @@ impl Kernels {
         edges_tail::<false, false, false>(inputs, [artifact, detail], &mut unused, done);
     }
 
-    pub(crate) fn replace_edge_maps(
+    pub(crate) fn replace_edge_map_rows(
         &self,
-        inputs: MapInputs<'_>,
+        region: MapRegion,
+        inputs: StridedMapInputs<'_>,
         [artifact, detail]: [&mut [f32]; 2],
         sums: [&mut (f64, f64); 2],
         fourth: [bool; 2],
     ) {
-        let n = artifact.len();
-        assert_eq!(detail.len(), n);
-        assert!(inputs.iter().all(|p| p.len() == n));
+        region.validate(inputs, &[artifact.len(), detail.len()]);
         let which = usize::from(fourth[0]) + 2 * usize::from(fourth[1]);
-        let mut delta = std::array::from_fn(|_| MapSums::default());
-        // SAFETY: dispatch checked features; every input and output has n elements.
-        let done = unsafe { self.replace_edges[which](inputs, [artifact, detail], &mut delta) };
-        match fourth {
-            [false, false] => {
-                edges_tail::<true, false, false>(inputs, [artifact, detail], &mut delta, done)
-            }
-            [true, false] => {
-                edges_tail::<true, true, false>(inputs, [artifact, detail], &mut delta, done)
-            }
-            [false, true] => {
-                edges_tail::<true, false, true>(inputs, [artifact, detail], &mut delta, done)
-            }
-            [true, true] => {
-                edges_tail::<true, true, true>(inputs, [artifact, detail], &mut delta, done)
-            }
-        }
-        for ((sum, delta), fourth) in sums.into_iter().zip(delta).zip(fourth) {
-            let delta = delta.total();
-            sum.0 += delta.0;
-            if fourth {
-                sum.1 += delta.1;
-            }
-        }
+        // SAFETY: dispatch checked CPU features and validation covered every row.
+        unsafe { self.replace_edges[which](region, inputs, [artifact, detail], sums) };
     }
 }
 
@@ -340,21 +462,39 @@ mod tests {
         {
             all.push((
                 "neon",
-                kernels!(neon, ss2_map_neon, ss2_sums_neon, ss2_edges_neon),
+                kernels!(
+                    #[target_feature(enable = "neon")]
+                    neon,
+                    ss2_map_neon,
+                    ss2_sums_neon,
+                    ss2_edges_neon
+                ),
             ));
         }
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         if std::is_x86_feature_detected!("avx2") {
             all.push((
                 "avx2",
-                kernels!(avx, ss2_map_avx2, ss2_sums_avx2, ss2_edges_avx2),
+                kernels!(
+                    #[target_feature(enable = "avx2")]
+                    avx,
+                    ss2_map_avx2,
+                    ss2_sums_avx2,
+                    ss2_edges_avx2
+                ),
             ));
         }
         #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
         if std::is_x86_feature_detected!("sse4.1") {
             all.push((
                 "sse4.1",
-                kernels!(sse, ss2_map_sse41, ss2_sums_sse41, ss2_edges_sse41),
+                kernels!(
+                    #[target_feature(enable = "sse4.1")]
+                    sse,
+                    ss2_map_sse41,
+                    ss2_sums_sse41,
+                    ss2_edges_sse41
+                ),
             ));
         }
         all
@@ -374,18 +514,41 @@ mod tests {
                     });
                     let before = input.clone();
                     let inputs = input.each_ref().map(|p| &p[offset..offset + n]);
-                    for kind in [MapKind::Ssim, MapKind::Artifact, MapKind::Detail] {
+                    let denominator: Vec<_> = inputs[0]
+                        .iter()
+                        .zip(inputs[2])
+                        .map(|(&src, &mean)| crate::metric::edge_denominator(src, mean))
+                        .collect();
+                    let precomputed =
+                        [&denominator[..], inputs[1], inputs[0], inputs[3], inputs[4]];
+                    for (kind, expected_kind, kernel_inputs) in [
+                        (MapKind::Ssim, MapKind::Ssim, inputs),
+                        (MapKind::Artifact, MapKind::Artifact, inputs),
+                        (MapKind::Detail, MapKind::Detail, inputs),
+                        (
+                            MapKind::ArtifactWithDenominator,
+                            MapKind::Artifact,
+                            precomputed,
+                        ),
+                    ] {
                         let expected: Vec<_> = (0..n)
-                            .map(|i| value(kind as usize, inputs.map(|p| p[i])))
+                            .map(|i| value(expected_kind as usize, inputs.map(|p| p[i])))
                             .collect();
                         let mut actual = vec![GUARD; n + 8];
                         let map = &mut actual[offset..offset + n];
                         let mut unused = MapSums::default();
                         // SAFETY: available_kernels checked features; all slices have n pixels.
-                        let done =
-                            unsafe { (kernels.compute[kind as usize])(inputs, map, &mut unused) };
+                        let done = unsafe {
+                            (kernels.compute[kind as usize])(kernel_inputs, map, &mut unused)
+                        };
                         assert!(done <= n);
-                        map_tail::<false, false>(kind as usize, inputs, map, &mut unused, done);
+                        map_tail::<false, false>(
+                            kind as usize,
+                            kernel_inputs,
+                            map,
+                            &mut unused,
+                            done,
+                        );
                         for (i, (&a, &b)) in map.iter().zip(&expected).enumerate() {
                             assert_eq!(
                                 a.to_bits(),
@@ -411,15 +574,17 @@ mod tests {
                             let map = &mut actual[offset..offset + n];
                             // SAFETY: same detected features and matching slices as above.
                             let done = unsafe {
-                                (kernels.replace[kind as usize][usize::from(fourth)])(
-                                    inputs, map, &mut delta,
+                                (kernels.replace_row[kind as usize][usize::from(fourth)])(
+                                    kernel_inputs,
+                                    map,
+                                    &mut delta,
                                 )
                             };
                             assert!(done <= n);
                             if fourth {
                                 map_tail::<true, true>(
                                     kind as usize,
-                                    inputs,
+                                    kernel_inputs,
                                     map,
                                     &mut delta,
                                     done,
@@ -427,7 +592,7 @@ mod tests {
                             } else {
                                 map_tail::<true, false>(
                                     kind as usize,
-                                    inputs,
+                                    kernel_inputs,
                                     map,
                                     &mut delta,
                                     done,
@@ -505,7 +670,7 @@ mod tests {
                     let mut delta = std::array::from_fn(|_| MapSums::default());
                     // SAFETY: same feature and length contracts as above.
                     let done =
-                        unsafe { (kernels.replace_edges[which])(inputs, [a, d], &mut delta) };
+                        unsafe { (kernels.replace_edges_row[which])(inputs, [a, d], &mut delta) };
                     assert!(done <= n);
                     match fourth {
                         [false, false] => {
@@ -537,6 +702,66 @@ mod tests {
                     assert_eq!(out[0], GUARD);
                     assert_eq!(out[n + 1], GUARD);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn strided_replacement_preserves_row_order_and_padding() {
+        const GUARD: f32 = -12345.0;
+        let values = [0.0, 1.0, 1e-7, -0.75, 1e20, 1e-4, 0.5];
+        for (name, kernels) in available_kernels() {
+            for width in [1, 4, 7, 8, 11, 17, 43] {
+                let region = MapRegion {
+                    width,
+                    height: 5,
+                    stride: width + 3,
+                };
+                let planes: [Vec<f32>; 5] = std::array::from_fn(|c| {
+                    (0..region.height * (width + c))
+                        .map(|i| values[(i + c * 3 + i / 11) % values.len()])
+                        .collect()
+                });
+                let inputs = std::array::from_fn(|c| (&planes[c][..], width + c));
+                let mut actual = vec![GUARD; region.height * region.stride];
+                for row in actual.chunks_mut(region.stride) {
+                    row[..width].fill(0.25);
+                }
+                let mut expected = actual.clone();
+                let mut expected_sum = (0.75, 0.5);
+                for (row, output) in expected.chunks_mut(region.stride).enumerate() {
+                    let inputs = inputs.map(|(p, stride)| &p[row * stride..row * stride + width]);
+                    let output = &mut output[..width];
+                    let mut delta = MapSums::default();
+                    // SAFETY: the detected backend is available and every slice has width samples.
+                    let done = unsafe {
+                        kernels.replace_row[MapKind::Artifact as usize][1](
+                            inputs, output, &mut delta,
+                        )
+                    };
+                    map_tail_kind::<1, true, true>(inputs, output, &mut delta, done);
+                    add_row_delta::<true>(&mut expected_sum, delta);
+                }
+                let mut actual_sum = (0.75, 0.5);
+                kernels.replace_map_rows(
+                    MapKind::Artifact,
+                    region,
+                    inputs,
+                    &mut actual,
+                    &mut actual_sum,
+                    true,
+                );
+                assert_eq!(actual, expected, "{name}, width={width}");
+                assert_eq!(
+                    actual_sum.0.to_bits(),
+                    expected_sum.0.to_bits(),
+                    "{name}, width={width}"
+                );
+                assert_eq!(
+                    actual_sum.1.to_bits(),
+                    expected_sum.1.to_bits(),
+                    "{name}, width={width}"
+                );
             }
         }
     }

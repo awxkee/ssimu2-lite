@@ -405,10 +405,14 @@ pub(crate) unsafe fn blur_vertical_region_neon(
         loop {
             let column = x.min(last);
             let mut y = 0;
+            // SAFETY: y + 4 <= outputs implies y + WINDOW + 3 <= rows.len(),
+            // and y < outputs implies y + WINDOW <= rows.len(). The last
+            // possible column leaves a full vector for each load and store.
             unsafe {
                 while y + 4 <= outputs {
-                    let window: [float32x4_t; WINDOW + 3] =
-                        std::array::from_fn(|j| vld1q_f32(rows[y + j].add(offset + column)));
+                    let window: [float32x4_t; WINDOW + 3] = std::array::from_fn(|j| {
+                        vld1q_f32(rows.get_unchecked(y + j).add(offset + column))
+                    });
                     for o in 0..4 {
                         let value = tap(&window[o..o + WINDOW], &coeff);
                         vst1q_f32(dst.add((y + o) * out_stride + column), value);
@@ -416,8 +420,9 @@ pub(crate) unsafe fn blur_vertical_region_neon(
                     y += 4;
                 }
                 while y < outputs {
-                    let window: [float32x4_t; WINDOW] =
-                        std::array::from_fn(|j| vld1q_f32(rows[y + j].add(offset + column)));
+                    let window: [float32x4_t; WINDOW] = std::array::from_fn(|j| {
+                        vld1q_f32(rows.get_unchecked(y + j).add(offset + column))
+                    });
                     vst1q_f32(dst.add(y * out_stride + column), tap(&window, &coeff));
                     y += 1;
                 }

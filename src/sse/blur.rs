@@ -389,6 +389,9 @@ pub(crate) unsafe fn blur_vertical_region_sse41(
 ) {
     debug_assert!(width >= 4 && rows.len() > 2 * RADIUS);
     let outputs = rows.len() - 2 * RADIUS;
+    // SAFETY: y + 4 <= outputs implies y + WINDOW + 3 <= rows.len(),
+    // and y < outputs implies y + WINDOW <= rows.len(). The last possible
+    // column leaves a full vector for each load and store.
     unsafe {
         let mut coeff = [_mm_set1_ps(0.0); RADIUS + 1];
         for (c, &v) in coeff.iter_mut().zip(k) {
@@ -414,7 +417,8 @@ pub(crate) unsafe fn blur_vertical_region_sse41(
                 while y + 4 <= outputs {
                     let mut window = [_mm_set1_ps(0.0); WINDOW + 3];
                     for (j, value) in window.iter_mut().enumerate() {
-                        *value = _mm_loadu_ps(rows[y + j].add(c * plane_stride + column));
+                        *value =
+                            _mm_loadu_ps(rows.get_unchecked(y + j).add(c * plane_stride + column));
                     }
                     for o in 0..4 {
                         _mm_storeu_ps(
@@ -427,7 +431,8 @@ pub(crate) unsafe fn blur_vertical_region_sse41(
                 while y < outputs {
                     let mut window = [_mm_set1_ps(0.0); WINDOW];
                     for (j, value) in window.iter_mut().enumerate() {
-                        *value = _mm_loadu_ps(rows[y + j].add(c * plane_stride + column));
+                        *value =
+                            _mm_loadu_ps(rows.get_unchecked(y + j).add(c * plane_stride + column));
                     }
                     _mm_storeu_ps(dst.add(y * out_stride + column), tap(&window));
                     y += 1;
